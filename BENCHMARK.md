@@ -100,6 +100,12 @@ V1 采用两种互相补充的 benchmark 模式：
 
 这是 Ubuntu 默认内核 `CONFIG_HARDENED_USERCOPY` 的开销。每次 send/recv 检查用户态 buffer 越界。两模式下绝对开销相近，占比差异来自分母不同。
 
+### syscall 不对称
+
+Pipeline 下 `perf stat` 显示 sendto = 1,500,600（精确匹配 500K × 3 轮），recvfrom = 5,737。sendto 是 recvfrom 的 260 倍。原因是 recv 线程每次 `::recv(buf, 65536)` 一次收大量回复，但服务端每条回复都单独调一次 `send()`。每次 sendto 触发一次 `__check_object_size`。
+
+优化方向：回复攒一批，buffer 满或 1ms 超时再 flush，sendto 次数可降到接近 recvfrom 的量级。
+
 ---
 
 ## 脉络
@@ -173,6 +179,6 @@ fp 火焰图里 `__libc_send` 占比很高，容易误认为时间都消耗在�
 - 撮合线程独占订单簿，仅处理撮合逻辑
 - 发送线程专职 send，即使阻塞也只影响自身，不波及接收和撮合
 
-这一步的目标是提升架构的吞吐上限，而非降低单次延迟。预计执行顺序：二进制协议 → epoll → 线程分离。
+这一步的目标是提升架构的吞吐上限，而非降低单次延迟。预计执行顺序：二进制协议 → 批量 send（攒 buffer flush，sendto 从 1.5M 降到几千）→ epoll → 线程分离。
 
 ---
