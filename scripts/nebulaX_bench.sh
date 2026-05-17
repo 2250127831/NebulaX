@@ -201,6 +201,7 @@ if [ "$HAS_SUDO" -eq 1 ]; then
 
     if [ -f "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" ] && \
        [ -f "$FLAMEGRAPH_DIR/flamegraph.pl" ]; then
+        mkdir -p "$BASE/profiling"
         FLAME_SVG="$BASE/profiling/nebulaX_flame_${MODE_NAME}.svg"
         echo ""
         echo -e "${BOLD}  火焰图${RESET}"
