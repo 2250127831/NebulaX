@@ -108,6 +108,29 @@ Order* OrderBook::getBestAsk()
     return &level.front();
 }
 
+TopOfBook OrderBook::getTopOfBook() const
+{
+    TopOfBook tob;
+
+    // 最高买价（bids_ 是 std::greater<>, begin() = 最高价）
+    if (!bids_.empty())
+    {
+        tob.bid_price = bids_.begin()->first;
+        for (const auto& order : bids_.begin()->second)
+            tob.bid_volume += order.remaining_qty;
+    }
+
+    // 最低卖价（asks_ 默认升序, begin() = 最低价）
+    if (!asks_.empty())
+    {
+        tob.ask_price = asks_.begin()->first;
+        for (const auto& order : asks_.begin()->second)
+            tob.ask_volume += order.remaining_qty;
+    }
+
+    return tob;
+}
+
 // 根据 order_id 查订单
 Order* OrderBook::findOrder(uint64_t order_id)
 {

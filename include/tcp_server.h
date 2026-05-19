@@ -1,17 +1,15 @@
 #pragma once
 
-#include <string>
+#include <vector>
 
 #include "matching_engine.h"
+#include "protocol.h"
 
 class TcpServer
 {
 public:
-    // 监听端口
     explicit TcpServer(
         int port,
-
-        // 撮合引擎引用
         MatchingEngine& engine
     );
 
@@ -26,19 +24,14 @@ private:
         int client_fd
     );
 
-    // 处理客户端请求
-    std::string processRequest(
-        const std::string& request
+    // 处理二进制命令，往 out 追加响应帧
+    void processRequest(
+        const BinaryCommand& cmd,
+        std::vector<BinaryResponse>& out_responses
     );
 
 private:
-    // 监听端口号
     int port_ = 0;
-
-    // server socket fd
     int server_fd_ = -1;
-
-    // 撮合引擎引用
-    // 网络层不拥有 engine 生命周期
     MatchingEngine& engine_;
 };

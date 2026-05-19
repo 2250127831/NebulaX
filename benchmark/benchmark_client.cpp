@@ -5,15 +5,18 @@
 //   taskset -c 0 ./nebulaX 2250
 //   taskset -c 1 ./benchmark_client 127.0.0.1 2250
 
-#include <iostream>
-#include <vector>
-#include <string>
+#include "../include/protocol.h"
+
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <algorithm>
 #include <random>
 #include <thread>
 #include <atomic>
+#include <vector>
+#include <string>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -44,7 +47,25 @@ static double tsc_ns() {
 // ── TCP Client ──
 class Client {
     int sock_ = -1;
-    std::string buf_;
+    std::vector<char> read_buf_;
+
+    // Ensure at least need bytes available in the read buffer
+    void fillBuffer(size_t need) {
+        while (read_buf_.size() < need) {
+            char raw[4096];
+            auto n = ::recv(sock_, raw, sizeof(raw), 0);
+            if (n <= 0) return;
+            read_buf_.insert(read_buf_.end(), raw, raw + n);
+        }
+    }
+
+    // Extract one 48-byte frame from buffer into rsp
+    void readFrame(BinaryResponse& rsp) {
+        fillBuffer(sizeof(rsp));
+        memcpy(&rsp, read_buf_.data(), sizeof(rsp));
+        read_buf_.erase(read_buf_.begin(), read_buf_.begin() + sizeof(rsp));
+    }
+
 public:
     Client(const char* ip, int port) {
         sock_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -60,40 +81,20 @@ public:
     ~Client() { if (sock_ >= 0) close(sock_); }
     bool ok() const { return sock_ >= 0; }
 
-    void sendLine(const std::string& line) {
-        auto m = line + '\n';
-        ::send(sock_, m.data(), m.size(), 0);
+    void sendCommand(const BinaryCommand& cmd) {
+        ::send(sock_, &cmd, sizeof(cmd), 0);
     }
 
-    std::string recvLine() {
-        std::string line;
-        while (true) {
-            auto pos = buf_.find('\n');
-            if (pos != std::string::npos) {
-                line = buf_.substr(0, pos);
-                buf_.erase(0, pos + 1);
-                return line;
-            }
-            char raw[4096];
-            auto n = ::recv(sock_, raw, sizeof(raw), 0);
-            if (n <= 0) { line = buf_; buf_.clear(); return line; }
-            buf_.append(raw, n);
-        }
+    void sendBatch(const void* data, size_t len) {
+        ::send(sock_, data, len, 0);
     }
 
-    std::string recvResponse() {
-        std::string full;
-        while (true) {
-            auto line = recvLine();
-            if (!full.empty()) full += '\n';
-            full += line;
-            if (line.substr(0,3)=="OK ") break;
-            if (line.substr(0,6)=="ERROR ") break;
-            if (line.substr(0,7)=="FILLED ") break;
-            if (line.substr(0,10)=="CANCELLED ") break;
-            if (line.find("BOOK_END") != std::string::npos) break;
-        }
-        return full;
+    // Read one complete response, skipping any intermediate TRADE frames.
+    // Uses an internal read buffer so one recv() feeds many frames.
+    void recvResponse(BinaryResponse& rsp) {
+        do {
+            readFrame(rsp);
+        } while (rsp.type == RSP_TRADE);
     }
 };
 
@@ -102,14 +103,6 @@ struct OrderInfo {
     uint64_t order_id;
     uint64_t user_id;
 };
-
-static uint64_t parseOrderId(const std::string& resp) {
-    auto eq = resp.find('=');
-    if (eq != std::string::npos) return std::stoull(resp.substr(eq+1));
-    auto sp = resp.rfind(' ');
-    if (sp != std::string::npos) return std::stoull(resp.substr(sp+1));
-    return 0;
-}
 
 struct PerCmdStats { double us; int type; };
 struct RunStats {
@@ -141,8 +134,8 @@ int main(int argc, char* argv[]) {
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <server_ip> [port] [mode]\n";
-        std::cerr << "  mode: -p (pipeline, default), -r (pingpong rtt)\n";
+        fprintf(stderr, "Usage: %s <server_ip> [port] [mode]\n", argv[0]);
+        fprintf(stderr, "  mode: -p (pipeline, default), -r (pingpong rtt)\n");
         return 1;
     }
     std::string ip = argv[1];
@@ -186,49 +179,88 @@ int main(int argc, char* argv[]) {
 
     for (int run = 0; run < N_RUNS; ++run) {
         Client c(ip.c_str(), port);
-        if (!c.ok()) { std::cerr << "connect failed\n"; continue; }
+        if (!c.ok()) { fprintf(stderr, "connect failed\n"); continue; }
 
         // ── pre-fill: 100 orders each side (ping-pong, not measured) ──
         std::vector<OrderInfo> open_orders;
         for (int i = 0; i < 100; ++i) {
-            c.sendLine("NEW BUY "  + std::to_string(9000 + i % 100) + " 10 " + std::to_string(BUY_UID));
-            auto r = c.recvResponse();
-            if (r.find("OK order_id=") != std::string::npos)
-                open_orders.push_back({parseOrderId(r), BUY_UID});
+            BinaryCommand cmd{};
+            cmd.type = CMD_NEW;
+            cmd.side = SIDE_BUY;
+            cmd.price = 9000 + i % 100;
+            cmd.quantity = 10;
+            cmd.user_id = BUY_UID;
+            c.sendCommand(cmd);
+
+            BinaryResponse rsp;
+            c.recvResponse(rsp);
+            if (rsp.type == RSP_OK || rsp.type == RSP_FILLED)
+                open_orders.push_back({rsp.data.ack.order_id, BUY_UID});
         }
         for (int i = 0; i < 100; ++i) {
-            c.sendLine("NEW SELL " + std::to_string(25000 + i % 100) + " 10 " + std::to_string(SELL_UID));
-            auto r = c.recvResponse();
-            if (r.find("OK order_id=") != std::string::npos)
-                open_orders.push_back({parseOrderId(r), SELL_UID});
+            BinaryCommand cmd{};
+            cmd.type = CMD_NEW;
+            cmd.side = SIDE_SELL;
+            cmd.price = 25000 + i % 100;
+            cmd.quantity = 10;
+            cmd.user_id = SELL_UID;
+            c.sendCommand(cmd);
+
+            BinaryResponse rsp;
+            c.recvResponse(rsp);
+            if (rsp.type == RSP_OK || rsp.type == RSP_FILLED)
+                open_orders.push_back({rsp.data.ack.order_id, SELL_UID});
         }
 
         if (pipeline) {
             // ── pipeline mode: 独立收发线程，测吞吐 ──
             SharedRing ring;
-            uint64_t next_oid = 201;
             auto start_time = steady_clock::now();
 
             std::thread sender([&]() {
-                for (auto& cmd : seq) {
+                // Batch sends: 128 × 32 bytes = 4096 bytes per flush
+                constexpr int BATCH = 64;
+                char batch_buf[BATCH * sizeof(BinaryCommand)];
+                int batch_count = 0;
+
+                auto flush = [&]() {
+                    if (batch_count > 0) {
+                        c.sendBatch(batch_buf,
+                                    batch_count * sizeof(BinaryCommand));
+                        batch_count = 0;
+                    }
+                };
+
+                for (int si = 0; si < TOTAL_CMDS; ++si) {
+                    auto& cmd = seq[si];
                     auto idx = ring.send_idx.fetch_add(1, std::memory_order_relaxed);
                     ring.ts_send[idx] = __rdtsc();
+
+                    auto* bc = reinterpret_cast<BinaryCommand*>(
+                        batch_buf + batch_count * sizeof(BinaryCommand));
+                    memset(bc, 0, sizeof(BinaryCommand));
                     if (cmd.type == 0) { // NEW
-                        auto is_buy = (cmd.side == 0);
-                        auto side_s = is_buy ? "BUY" : "SELL";
-                        auto uid = is_buy ? BUY_UID : SELL_UID;
-                        c.sendLine(std::string("NEW ") + side_s + " " + std::to_string(cmd.price)
-                                   + " " + std::to_string(cmd.qty) + " " + std::to_string(uid));
+                        bc->type = CMD_NEW;
+                        bc->side = (cmd.side == 0) ? SIDE_BUY : SIDE_SELL;
+                        bc->price = cmd.price;
+                        bc->quantity = cmd.qty;
+                        bc->user_id = (cmd.side == 0) ? BUY_UID : SELL_UID;
                     } else {
-                        c.sendLine("BOOK");  // CANCEL → BOOK
+                        bc->type = CMD_BOOK;
                     }
+                    batch_count++;
+
+                    if (batch_count == BATCH)
+                        flush();
                 }
+                flush(); // remaining
             });
 
             std::thread receiver([&]() {
                 uint64_t count = 0;
+                BinaryResponse rsp;
                 while (count < TOTAL_CMDS) {
-                    c.recvResponse();
+                    c.recvResponse(rsp);
                     auto idx = ring.recv_idx.fetch_add(1, std::memory_order_relaxed);
                     ring.ts_recv[idx] = __rdtsc();
                     count++;
@@ -267,15 +299,19 @@ int main(int argc, char* argv[]) {
                 bool sent = false;
 
                 if (cmd.type == 0) { // NEW
-                    auto is_buy = (cmd.side == 0);
-                    auto side_s = is_buy ? "BUY" : "SELL";
-                    auto uid = is_buy ? BUY_UID : SELL_UID;
-                    c.sendLine(std::string("NEW ") + side_s + " " + std::to_string(cmd.price)
-                               + " " + std::to_string(cmd.qty) + " " + std::to_string(uid));
+                    BinaryCommand bc{};
+                    bc.type = CMD_NEW;
+                    bc.side = (cmd.side == 0) ? SIDE_BUY : SIDE_SELL;
+                    bc.price = cmd.price;
+                    bc.quantity = cmd.qty;
+                    bc.user_id = (cmd.side == 0) ? BUY_UID : SELL_UID;
+                    c.sendCommand(bc);
                     sent = true;
-                    auto resp = c.recvResponse();
-                    if (resp.find("OK order_id=") != std::string::npos)
-                        open_orders_pp.push_back({parseOrderId(resp), uid});
+
+                    BinaryResponse rsp;
+                    c.recvResponse(rsp);
+                    if (rsp.type == RSP_OK || rsp.type == RSP_FILLED)
+                        open_orders_pp.push_back({rsp.data.ack.order_id, bc.user_id});
                     passed_cmds++;
 
                 } else if (cmd.type == 1) { // CANCEL
@@ -288,16 +324,36 @@ int main(int argc, char* argv[]) {
                         open_orders_pp.pop_back();
                     }
                     if (cancel_oid > 0) {
-                        c.sendLine("CANCEL " + std::to_string(cancel_oid) + " " + std::to_string(cancel_uid));
+                        BinaryCommand bc{};
+                        bc.type = CMD_CANCEL;
+                        bc.order_id = cancel_oid;
+                        bc.user_id = cancel_uid;
+                        c.sendCommand(bc);
                         sent = true;
-                        c.recvResponse();
+
+                        BinaryResponse rsp;
+                        c.recvResponse(rsp);
                         passed_cmds++;
                     } else {
-                        c.sendLine("BOOK"); sent = true; c.recvResponse(); passed_cmds++;
+                        BinaryCommand bc{};
+                        bc.type = CMD_BOOK;
+                        c.sendCommand(bc);
+                        sent = true;
+
+                        BinaryResponse rsp;
+                        c.recvResponse(rsp);
+                        passed_cmds++;
                     }
 
                 } else { // BOOK
-                    c.sendLine("BOOK"); sent = true; c.recvResponse(); passed_cmds++;
+                    BinaryCommand bc{};
+                    bc.type = CMD_BOOK;
+                    c.sendCommand(bc);
+                    sent = true;
+
+                    BinaryResponse rsp;
+                    c.recvResponse(rsp);
+                    passed_cmds++;
                 }
 
                 auto end = high_resolution_clock::now();

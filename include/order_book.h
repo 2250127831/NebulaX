@@ -8,6 +8,15 @@
 #include <sstream>
 #include "order.h"
 
+// Top-of-book 数据（best bid / best ask 的聚合量）
+struct TopOfBook
+{
+    uint32_t bid_price  = 0;
+    uint32_t bid_volume = 0;
+    uint32_t ask_price  = 0;
+    uint32_t ask_volume = 0;
+};
+
 class OrderBook
 {
 public:
@@ -35,6 +44,9 @@ public:
 
     // 获取最优卖价（最低 ask）
     Order* getBestAsk();
+
+    // 获取 top-of-book（best bid / best ask 的聚合量）
+    TopOfBook getTopOfBook() const;
 
     // 根据 order_id 查订单
     Order* findOrder(uint64_t order_id);

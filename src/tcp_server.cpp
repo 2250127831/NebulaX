@@ -1,48 +1,54 @@
 #include "tcp_server.h"
-#include "protocol.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
-#include <iostream>
-#include <sstream>
 
 TcpServer::TcpServer(int port, MatchingEngine& engine)
     : port_(port), engine_(engine)
 {
-    // 创建 TCP socket
     server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
-        std::cerr << "ERROR: socket() failed\n";
+        write(STDERR_FILENO, "ERROR: socket() failed\n", 23);
         return;
     }
 
-    // 允许地址重用，避免 TIME_WAIT 问题
     int opt = 1;
     setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // 绑定地址和端口
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port_);
     if (bind(server_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "ERROR: bind() failed\n";
+        write(STDERR_FILENO, "ERROR: bind() failed\n", 21);
         close(server_fd_);
         server_fd_ = -1;
         return;
     }
 
-    // 开始监听
     if (listen(server_fd_, 10) < 0) {
-        std::cerr << "ERROR: listen() failed\n";
+        write(STDERR_FILENO, "ERROR: listen() failed\n", 23);
         close(server_fd_);
         server_fd_ = -1;
         return;
     }
 
-    std::cout << "NebulaX server listening on port " << port_ << "\n";
+    const char msg[] = "NebulaX server listening on port ";
+    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    // 端口号数字转字符输出（简单实现，不含 locale）
+    char pbuf[16];
+    int len = 0;
+    int tmp = port_;
+    do { pbuf[len++] = '0' + tmp % 10; tmp /= 10; } while (tmp);
+    for (int i = 0; i < len / 2; ++i) {
+        char c = pbuf[i];
+        pbuf[i] = pbuf[len - 1 - i];
+        pbuf[len - 1 - i] = c;
+    }
+    write(STDOUT_FILENO, pbuf, len);
+    write(STDOUT_FILENO, "\n", 1);
 }
 
 TcpServer::~TcpServer()
@@ -55,7 +61,7 @@ TcpServer::~TcpServer()
 void TcpServer::start()
 {
     if (server_fd_ < 0) {
-        std::cerr << "ERROR: server not initialized\n";
+        write(STDERR_FILENO, "ERROR: server not initialized\n", 30);
         return;
     }
 
@@ -64,66 +70,71 @@ void TcpServer::start()
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd_, (sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
-            std::cerr << "ERROR: accept() failed\n";
+            write(STDERR_FILENO, "ERROR: accept() failed\n", 23);
             continue;
         }
 
-        // 每个客户端连接交给 handleClient 处理
         handleClient(client_fd);
-
-        // 处理完毕后关闭客户端连接
         close(client_fd);
     }
 }
 
 void TcpServer::handleClient(int client_fd)
 {
-    std::string request_line;
-    char buffer[4096];
-    ssize_t n;
-    // 循环接收数据，按行处理（每行一个命令）
-    while ((n = recv(client_fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[n] = '\0';
-        request_line += buffer;
-        // 处理所有完整的行（以 '\n' 结尾）
-        size_t pos;
-        while ((pos = request_line.find('\n')) != std::string::npos) {
-            std::string line = request_line.substr(0, pos);
-            // 移除可能的 '\r'
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
-            request_line.erase(0, pos + 1);
+    char buf[4096];
+    size_t pending = 0;
+    std::vector<BinaryResponse> responses;
+    responses.reserve(8);
 
-            // 处理该行命令
-            std::string response = processRequest(line);
-            response += "\n";
-            send(client_fd, response.c_str(), response.size(), 0);
+    ssize_t n;
+    while ((n = recv(client_fd, buf + pending, sizeof(buf) - pending, 0)) > 0) {
+        pending += n;
+
+        size_t consumed = 0;
+        while (pending - consumed >= sizeof(BinaryCommand)) {
+            BinaryCommand cmd;
+            memcpy(&cmd, buf + consumed, sizeof(cmd));
+            consumed += sizeof(BinaryCommand);
+
+            responses.clear();
+            if (!validateCommand(cmd)) {
+                auto& rsp = responses.emplace_back();
+                rsp.type = RSP_ERROR;
+                rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_COMMAND_TYPE);
+            } else {
+                processRequest(cmd, responses);
+            }
+
+            if (!responses.empty()) {
+                send(client_fd, responses.data(),
+                     responses.size() * sizeof(BinaryResponse), 0);
+            }
         }
+
+        size_t remaining = pending - consumed;
+        if (remaining > 0 && remaining < pending) {
+            memmove(buf, buf + consumed, remaining);
+        }
+        pending = remaining;
     }
     // 客户端断开或出错
 }
 
-std::string TcpServer::processRequest(const std::string& request)
+void TcpServer::processRequest(const BinaryCommand& cmd, std::vector<BinaryResponse>& out)
 {
-    // 忽略空行
-    if (request.empty())
-        return "ERROR empty_request";
-
-    // 解析协议命令
-    Command cmd = Protocol::parseCommand(request);
-
-    // 根据命令类型分发到撮合引擎
     switch (cmd.type) {
-        case CommandType::NEW:
-            return engine_.processNewOrder(cmd.side, cmd.price, cmd.quantity, cmd.user_id);
-
-        case CommandType::CANCEL:
-            return engine_.processCancel(cmd.order_id, cmd.user_id);
-
-        case CommandType::BOOK:
-            return engine_.getBook(cmd.levels); // 默认 5 档
-
-        default:
-            return "ERROR invalid_command";
+        case CMD_NEW: {
+            Side side = (cmd.side == SIDE_BUY) ? Side::BUY : Side::SELL;
+            engine_.processNewOrder(side, cmd.price, cmd.quantity, cmd.user_id, out);
+            break;
+        }
+        case CMD_CANCEL:
+            engine_.processCancel(cmd.order_id, cmd.user_id, out);
+            break;
+        case CMD_BOOK: {
+            auto& rsp = out.emplace_back();
+            engine_.getBook(rsp);
+            break;
+        }
     }
 }
