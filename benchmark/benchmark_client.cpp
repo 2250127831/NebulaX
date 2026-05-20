@@ -218,7 +218,7 @@ int main(int argc, char* argv[]) {
             auto start_time = steady_clock::now();
 
             std::thread sender([&]() {
-                constexpr int BATCH = 64;
+                constexpr int BATCH = 128;
                 char batch_buf[BATCH * sizeof(BinaryCommand)];
                 int batch_count = 0;
 
