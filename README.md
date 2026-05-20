@@ -4,7 +4,7 @@
 
 ## 架构
 
-![NebulaX 架构图](docs/images/架构图.jpg)
+![NebulaX 架构图](docs/images/V1.1架构图.png)
 
 ### Matching Engine
 
@@ -13,30 +13,28 @@
 - `std::map<price, list<Order>>` 买卖盘 + `unordered_map<order_id, iterator>` O(1) 撤单索引
 - 撮合逻辑与 OrderBook 解耦
 
-### 协议（V1，文本）
+### 协议（二进制，定长帧）
 
-![NebulaX 文本协议](docs/images/文本协议.jpg)
-
-撤单时会校验 user_id 是否匹配。
+命令 32 字节，响应 48 字节。定义见 [protocol.h](include/protocol.h)。
 
 ## 当前阶段
 
-**V1：** Blocking TCP + 单线程 + 文本协议 + std 容器
+**V1.1（当前 Phase 3 已完成）：** Blocking TCP + 单线程 + 二进制协议 + std 容器
 
 | 指标 | Ping-pong（RTT） | Pipeline（吞吐） |
 |------|:----------------:|:----------------:|
-| QPS | 141,070 | **692,909** |
-| 平均延迟 | 7 µs | 175 ms |
-| P50 | 7 µs | 195 ms |
-| P99 | 10 µs | 253 ms |
-| P999 | 19 µs | 255 ms |
-| IPC | 1.98 | **2.94** |
-| ctx/s | 121,250 | **207** |
-| syscall/s | ~250K | ~250K |
+| QPS | **135K** | **1,954K** |
+| 平均延迟 | 7 µs | 33 ms |
+| P50 | 7 µs | 36 ms |
+| P99 | 10 µs | 37 ms |
+| P999 | 29 µs | 63 ms |
+| IPC | 1.39 | **2.00** |
+| ctx/s | 124K | 653 |
+| sendto | 1,500,600 | 1,500,600 |
+| recvfrom | 1,500,600 | 12,554 |
 
-> 两种模式互补：Ping-pong 测单笔交互延迟（交易者视角），Pipeline 测引擎吞吐上限（gateway 视角）。<br>
-> 买卖价格重叠（10000~14999），含真实撮合。每模式 3 × 500K 命令。<br>
-> 内核安全检查（`__check_object_size`）占用 Ping-pong 下约 26% CPU、Pipeline 下约 10%，这是 Ubuntu 默认内核 `CONFIG_HARDENED_USERCOPY` 的开销。每次 syscall 触发一次。<br>
+> Ping-pong 延迟维持 V1 水平（7µs P50），Pipeline 吞吐从 66 万提升到 195 万 QPS（+194%）。<br>
+> 收益来自二进制协议 + 批量收发的组合效果，两者缺一不可。详见 [优化记录](docs/optimizations/binary_protocol.md)。<br>
 
 硬件：12th Gen Intel Core i9-12900HX / 24 核 / 31GB RAM / Ubuntu 22.04<br>
 绑核：服务端 core 6（P-core），客户端 core 5（P-core），taskset 隔离<br>
@@ -61,7 +59,7 @@ sudo bash ./scripts/nebulaX_bench.sh 2250 -r    # ping-pong 模式
 - kernel 安全检查开销分析（`__check_object_size` 等）
 - 汇总行：一条命令看全关键指标
 
-详细方法论和数据分析见 [BENCHMARK.md](BENCHMARK.md)。
+详细方法论和数据分析见 [BENCHMARK.md](docs/BENCHMARK.md)。
 
 ## 环境
 
@@ -77,7 +75,7 @@ NebulaX/
 │   ├── order.h               订单定义
 │   ├── order_book.h          买卖盘 + 索引
 │   ├── matching_engine.h     撮合引擎
-│   ├── protocol.h            文本协议解析
+│   ├── protocol.h            二进制协议定义（32B 命令 / 48B 响应）
 │   └── tcp_server.h          Blocking TCP 服务端
 ├── src/                   # 实现
 ├── benchmark/             # 压测客户端
@@ -85,22 +83,17 @@ NebulaX/
 ├── scripts/
 │   └── nebulaX_bench.sh       压测 + perf 脚本
 ├── docs/
-│   └── images/                配图（架构图等）
+│   ├── BENCHMARK.md           # V1 基线压测报告
+│   ├── optimizations/         # 各阶段优化实验记录
+│   └── images/                配图
 ├── profiling/             # 火焰图等 profiling 产出
-├── BENCHMARK.md           # 性能监测报告
 └── README.md
 ```
 
 ### 优化方向
 
-| 优化 | 目标 | 数据支撑 | 依赖 |
-|------|------|---------|------|
-| 二进制协议 | 砍掉 ~15% locale + ~12% 堆分配 | 火焰图自采样前两位 | 无 |
-| 批量 send | sendto syscall 从 1.5M 降到几千 | Pipeline sendto 是 recvfrom 的 260 倍 | 无 |
-| epoll | 单线程管多个连接，线程分离的前提 | 当前只能串行 accept | 无 |
-| 线程分离 | send 阻塞不波及撮合，利用多核 | 8 核只用 1 核 | epoll |
-
-
-**二进制协议**不依赖 IO 模型和线程模型，改了立即可测。**批量 send** 在 pipeline 模式下攒 buffer 再 flush，sendto 次数从 1.5M 降到几千。**epoll** 把连接上限从 1 解开，作为线程分离的底盘。**线程分离**解 send 阻塞拖累全局的问题，利用多核并行。
-
-四项互不冲突，预计顺序：二进制协议 → 批量 send → epoll → 线程分离。
+| 优化 | 状态 | 目标 |
+|------|----|------|
+| 二进制协议 + 批量收发 |  已完成 | 砍掉 locale + 堆分配，Pipeline 3x QPS |
+| epoll |  待开始 | 单线程管多个连接，线程分离的前提 |
+| 线程分离 | 待开始 | send 阻塞不波及撮合，利用多核 |

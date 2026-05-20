@@ -218,7 +218,6 @@ int main(int argc, char* argv[]) {
             auto start_time = steady_clock::now();
 
             std::thread sender([&]() {
-                // Batch sends: 128 × 32 bytes = 4096 bytes per flush
                 constexpr int BATCH = 64;
                 char batch_buf[BATCH * sizeof(BinaryCommand)];
                 int batch_count = 0;
@@ -250,7 +249,7 @@ int main(int argc, char* argv[]) {
                     }
                     batch_count++;
 
-                    if (batch_count == BATCH)
+                    if (batch_count >= BATCH)
                         flush();
                 }
                 flush(); // remaining
