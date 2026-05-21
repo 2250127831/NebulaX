@@ -74,38 +74,50 @@ bool OrderBook::removeOrder(uint64_t order_id, uint64_t user_id)
     return true;
 }
 
-// 获取最优买价（最高 bid）
-Order* OrderBook::getBestBid()
+// 获取最优买价（最高 bid），可排除指定 user_id（自成交防护）
+Order* OrderBook::getBestBid(uint64_t exclude_user_id)
 {
-    if (bids_.empty())
+    if (!exclude_user_id)
     {
-        return nullptr;
+        // 快速路径：不排除
+        if (bids_.empty()) return nullptr;
+        auto& level = bids_.begin()->second;
+        return level.empty() ? nullptr : &level.front();
     }
 
-    auto& level = bids_.begin()->second;
-    if (level.empty())
+    // 遍历所有价位，跳过被排除 user_id 的订单
+    for (auto& [price, olist] : bids_)
     {
-        return nullptr;
+        for (auto& order : olist)
+        {
+            if (order.user_id == exclude_user_id) continue;
+            return &order;
+        }
     }
-
-    return &level.front();
+    return nullptr;
 }
 
-// 获取最优卖价（最低 ask）
-Order* OrderBook::getBestAsk()
+// 获取最优卖价（最低 ask），可排除指定 user_id（自成交防护）
+Order* OrderBook::getBestAsk(uint64_t exclude_user_id)
 {
-    if (asks_.empty())
+    if (!exclude_user_id)
     {
-        return nullptr;
+        // 快速路径：不排除
+        if (asks_.empty()) return nullptr;
+        auto& level = asks_.begin()->second;
+        return level.empty() ? nullptr : &level.front();
     }
 
-    auto& level = asks_.begin()->second;
-    if (level.empty())
+    // 遍历所有价位，跳过被排除 user_id 的订单
+    for (auto& [price, olist] : asks_)
     {
-        return nullptr;
+        for (auto& order : olist)
+        {
+            if (order.user_id == exclude_user_id) continue;
+            return &order;
+        }
     }
-
-    return &level.front();
+    return nullptr;
 }
 
 TopOfBook OrderBook::getTopOfBook() const

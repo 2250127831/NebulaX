@@ -92,7 +92,7 @@ void MatchingEngine::matchBuyOrder(Order& order, std::vector<BinaryResponse>& ou
 {
     while (order.remaining_qty > 0)
     {
-        Order* best_ask = order_book_.getBestAsk();
+        Order* best_ask = order_book_.getBestAsk(order.user_id);
         if (!best_ask) break;
 
         if (order.price < best_ask->price) break;
@@ -138,7 +138,7 @@ void MatchingEngine::matchSellOrder(Order& order, std::vector<BinaryResponse>& o
 {
     while (order.remaining_qty > 0)
     {
-        Order* best_bid = order_book_.getBestBid();
+        Order* best_bid = order_book_.getBestBid(order.user_id);
         if (!best_bid) break;
 
         if (order.price > best_bid->price) break;

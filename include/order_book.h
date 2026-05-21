@@ -39,11 +39,11 @@ public:
     // 撤单
     bool removeOrder(uint64_t order_id, uint64_t user_id);
 
-    // 获取最优买价（最高 bid）
-    Order* getBestBid();
+    // 获取最优买价（最高 bid），可排除指定 user_id（自成交防护）
+    Order* getBestBid(uint64_t exclude_user_id = 0);
 
-    // 获取最优卖价（最低 ask）
-    Order* getBestAsk();
+    // 获取最优卖价（最低 ask），可排除指定 user_id（自成交防护）
+    Order* getBestAsk(uint64_t exclude_user_id = 0);
 
     // 获取 top-of-book（best bid / best ask 的聚合量）
     TopOfBook getTopOfBook() const;
