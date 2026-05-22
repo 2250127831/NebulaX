@@ -213,8 +213,8 @@ void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
 
     size_t bytes = count * sizeof(BinaryResponse);
 
-    // 快速路径：ring 空（Send 线程阻塞在 eventfd）→ 直接 send，绕过 ring
-    if (ring_.free_space() == RING_SIZE) {
+    // 快速路径：少量响应帧时直接 send，绕过 ring（保持 ping-pong 低延迟）
+    if (count <= 100 && ring_.free_space() == RING_SIZE) {
         const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
         size_t sent = 0;
         int spins = 0;
