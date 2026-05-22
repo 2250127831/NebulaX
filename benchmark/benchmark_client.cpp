@@ -106,7 +106,7 @@ struct Cmd {
 struct PerCmdStats { double us; int type; };
 struct RunStats {
     double avg_us, p50, p99, p999, qps;
-    int total;
+    int64_t total;
 };
 
 static double pct(std::vector<double>& v, double p) {
@@ -132,7 +132,8 @@ struct WorkerRing {
 struct WorkerResult {
     std::vector<double> lat_us;
     double qps;
-    int count;
+    int64_t count;
+    int64_t wall_us;
 };
 
 static WorkerResult runWorker(const char* ip, int port,
@@ -224,6 +225,7 @@ static WorkerResult runWorker(const char* ip, int port,
         steady_clock::now() - start_time).count();
 
     wr.count = count;
+    wr.wall_us = wall_us;
     wr.qps = count * 1'000'000.0 / wall_us;
     wr.lat_us.resize(count);
     double ns = tsc_ns();
@@ -253,7 +255,7 @@ int main(int argc, char* argv[]) {
     tsc_ns();  // prime calibration
 
     const int N_RUNS   = 3;
-    const int TOTAL_CMDS = 500000;
+    const int64_t TOTAL_CMDS = 500000;
     const int N_NEW    = TOTAL_CMDS * 50 / 100;
     const int N_CANCEL = TOTAL_CMDS * 25 / 100;
     const int N_BOOK   = TOTAL_CMDS * 25 / 100;
@@ -334,15 +336,16 @@ int main(int argc, char* argv[]) {
             }
             for (auto& t : threads) t.join();
 
-            // 汇总
+            // 汇总（QPS = 总命令数 / 最长耗时，避免多 worker 求和虚高）
             std::vector<double> all_lat;
-            double sum_qps = 0;
-            int total_cnt = 0;
+            int64_t total_cmds = 0;
+            int64_t max_wall_us = 0;
             for (auto& wr : wrs) {
-                sum_qps += wr.qps;
-                total_cnt += wr.count;
+                total_cmds += wr.count;
+                if (wr.wall_us > max_wall_us) max_wall_us = wr.wall_us;
                 all_lat.insert(all_lat.end(), wr.lat_us.begin(), wr.lat_us.end());
             }
+            double true_qps = max_wall_us > 0 ? total_cmds * 1'000'000.0 / max_wall_us : 0;
 
             std::sort(all_lat.begin(), all_lat.end());
             double avg = 0;
@@ -352,8 +355,8 @@ int main(int argc, char* argv[]) {
 
             printf("\nRun %d (pipeline, %d conns):\n", run + 1, N_CONN);
             printf("  QPS=%8.0f  avg=%5.0fus  P50=%4.0fus  P99=%5.0fus  P999=%5.0fus\n",
-                   sum_qps, avg, p50, p99, p999);
-            runs.push_back({avg, p50, p99, p999, sum_qps, total_cnt});
+                   true_qps, avg, p50, p99, p999);
+            runs.push_back({avg, p50, p99, p999, true_qps, total_cmds});
 
         } else {
             // ── pingpong mode: 单连接 RTT（保持不变） ──
