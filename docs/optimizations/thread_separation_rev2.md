@@ -21,7 +21,7 @@
 
 与前序保持一致：同一命令序列（50% NEW + 25% CANCEL + 25% BOOK，价格区间 10000~14999 重叠），Pipeline 模式每轮 500K 条（4 连接平分），重复 3 轮。新增 10K 条预热消除冷 cache 影响。
 
-**QPS 计算修正：** 多 worker 场景下 QPS 采用 `total_cmds / max_wall_us`（总命令数 / 最慢 worker 耗时），替代旧的 `Σ(count_i / wall_i)` 求和算法。旧算法在多 worker 场景下因各 worker 起止时间差异导致 QPS 虚高约 2 倍。
+**QPS 计算说明：** 采用 `total_cmds / max_wall_us`（总命令数 / 最慢 worker 耗时）。多 worker 场景下各 worker 起止时间有差异，`Σ(count_i / wall_i)` 求和会导致 QPS 虚高。
 
 ---
 
@@ -40,21 +40,11 @@ epoll(EPOLLIN)                     eventfd blocking read (唤醒)
     └─ count > 100  → push ring + write(eventfd)
 ```
 
-**Ring 设计：** 纯字节缓冲区（1MB），push/pop 内部自动处理环形 wrap。数据流用 `RSP_HEADER` 帧（新增 type 0x87）做消息边界——IO 线程推送 `[RSP_HEADER(fd, count) + count 帧响应]`，Send 线程读 header → 取 fd + count → `read_acquire` 拿到 ring 内部指针直接 `send()`，零拷贝。
+**Ring 设计：** 纯字节缓冲区（1MB），push/pop 内部自动处理 wrap。`RSP_HEADER`（type 0x87）做帧同步。read_acquire 返回 ring 内部指针直接 send，零拷贝。
 
-**自适应快速路径：** 响应帧数 ≤ 100 时 IO 线程直接 send。ping-pong 走快速路径保持低延迟，pipeline 走 ring 路径激活双线程并行。
+**自适应快速路径：** 响应帧 ≤ 100 时 IO 线程直接 send。ping-pong 走快速路径保持 8µs，pipeline 走 ring 激活双线程。
 
-**通知机制：** eventfd blocking read 替代 epoll。批粒度通知。
-
-### 改动文件
-
-| 文件 | 改动 |
-|------|------|
-| `include/protocol.h` | 新增 `RSP_HEADER = 0x87` + union `header { client_fd, count }` |
-| `include/spsc_byte_ring.h` | 新建，字节级 SPSC ring |
-| `include/tcp_server.h` | `ConnContext` 去掉 resp_buf/sent/write_interested |
-| `src/tcp_server.cpp` | `handleRead` 攒批推送；自适应快速路径 |
-| `src/main.cpp` | 双线程框架；eventfd blocking read |
+**通知机制：** eventfd blocking read。批粒度通知。
 
 ---
 
@@ -62,23 +52,19 @@ epoll(EPOLLIN)                     eventfd blocking read (唤醒)
 
 ### 关键指标一览
 
-| 指标 | Phase 4 | Phase 5 rev2 | Δ |
-|:----|:-------:|:------------:|:-:|
-| **Pipeline QPS（burst）** | **7.4M** | **8.5M** | **+15%** |
-| **Pipeline QPS（持续 50M）** | **4.1M** | **7.2M** | **+76%** |
-| **Pipeline avg** | 26 ms | 21 ms | -19% |
-| **Ping-pong avg** | 8 µs | **8 µs** | 不变 |
-| **Ping-pong P50** | 8 µs | 8 µs | 不变 |
-| **Ping-pong P999** | 30 µs | **26 µs** | -13% |
-| **IPC** | 1.30 | 1.28 | — |
-| **sendto/run** | 31,308 | 81,058 | +2.6× |
-| **recvfrom/run** | 105,649 | 105,597 | 不变 |
+| 指标 | Phase 3 | Phase 4 | Phase 5 rev2 |
+|:----|:-------:|:-------:|:------------:|
+| Pipeline burst (500K) | 1.95M | 7.4M | **8.5M** |
+| Pipeline sustained (50M) | 2.4M | 4.1M | **7.2M** |
+| Ping-pong avg | 7µs | 8µs | **8µs** |
+| IPC（burst）| — | 1.30 | 1.28 |
+| IPC（sustained）| — | 0.64 | **0.99** |
 
-> 注：Phase 4 原文记载 QPS 13.5M，系 QPS 求和算法虚高。实测重跑修正后为 7.4M。两阶段对比使用同一修正算法、同一环境。
+Phase 5 rev2 相比 Phase 4：burst +15%，sustained **+76%**。持续负载下差距远大于 burst，原因是 Phase 4 的 resp_buf 管理在长跑中导致 IPC 从 1.30 跌至 0.64，Phase 5 rev2 稳定在 0.99。
 
 ### 逐轮明细
 
-#### Pipeline（4 连接）
+#### Pipeline（500K burst）
 
 | 轮次 | Phase 4 QPS | Phase 5 rev2 QPS |
 |:----|:----------:|:----------------:|
@@ -87,72 +73,36 @@ epoll(EPOLLIN)                     eventfd blocking read (唤醒)
 | 3 | 8,206,408 | 8,841,889 |
 | **均** | **7,403,743** | **8,511,851** |
 
+#### Pipeline（50M sustained）
+
+| 轮次 | Phase 4 QPS | Phase 5 rev2 QPS |
+|:----|:----------:|:----------------:|
+| 1 | 4,371,021 | 7,513,994 |
+| 2 | 3,592,313 | 7,333,043 |
+| 3 | 4,471,429 | 6,766,662 |
+| **均** | **4,144,921** | **7,204,566** |
+
 #### Ping-pong
 
 | 轮次 | avg | P50 | P99 | P999 | QPS |
 |-----|----:|----:|----:|----:|----:|
-| 1 | 8 µs | 8 µs | 12 µs | 25 µs | 119,732 |
-| 2 | 9 µs | 8 µs | 12 µs | 26 µs | 117,212 |
-| 3 | 8 µs | 8 µs | 11 µs | 26 µs | 120,236 |
-| **平** | **8 µs** | **8 µs** | **12 µs** | **26 µs** | **119,060** |
-
----
-
-## 性能分析
-
-### Pipeline +76%（持续负载）
-
-持续 50M 命令下 Phase 4 QPS 跌至 4.1M（IPC 0.64），Phase 5 rev2 稳定在 7.2M（IPC 0.99）。差距 76%。
-
-原因是 Phase 4 的 `resp_buf` 管理（`emplace_back` / `memmove` / `epoll_ctl`）在长跑中导致内存布局碎片化，cache miss 急剧上升。Phase 5 rev2 去掉了这些 per-connection 状态，路径更短、更可预测。
-
-Burst 500K 下两者差距较小（+15%），因为短时间内存热度高，管理开销未充分暴露。
-
-### 提升来源
-
-Phase 5 rev2 去掉了以下开销：
-
-- **Phase 4**：`handleRead` 后调 `trySendResponses`，涉及 `conn->resp_buf` 的 `emplace_back`、`memmove`（移除已发送帧）、`epoll_ctl(MOD, EPOLLOUT)` 注册注销
-- **Phase 5 rev2**：积累响应到临时 `vector`，ET drain 结束后一次性 `pushResponses`。100 帧阈值让 pipeline 的大批量响应走 ring 路径，Send 线程参与发送
-
-### Ping-pong 延迟不变
-
-快速路径保证小批量（1-3 帧）直接 send 不走 ring。`syscalls:sys_enter_read = 30` 确认 ring 路径仅在 pipeline 大 batch 时触发。
-
----
-
-## 火焰图对比
-
-| 分类 | Phase 4 | Phase 5 rev2 | 说明 |
-|:----|:-------:|:------------:|------|
-| 撮合逻辑 | ~59% | ~60% | 占比相近，仍是瓶颈 |
-| send 路径 | ~18.8% | ~17.5% | Send 线程分担后 IO 侧下降 |
-| recv 路径 | ~8% | ~8% | 不变 |
-| 管理开销 | ~14% | ~8% | 去掉 resp_buf/epoll_ctl |
+| 1 | 8µs | 8µs | 12µs | 25µs | 119,732 |
+| 2 | 9µs | 8µs | 12µs | 26µs | 117,212 |
+| 3 | 8µs | 8µs | 11µs | 26µs | 120,236 |
+| **平** | **8µs** | **8µs** | **12µs** | **26µs** | **119,060** |
 
 ---
 
 ## 硬件事件
 
-| 事件 | Phase 4 | Phase 5 rev2 | 变化 |
-|:----|:-------:|:------------:|:----:|
-| IPC | 1.30 | 1.28 | -2% |
-| cache-misses | 9,390,601 | 6,575,277 | -30% |
-| L1-dcache-load-misses | 17,636,359 | 18,405,322 | +4% |
-| L2-load-misses | 1,807,453 | 1,614,898 | -11% |
-| syscalls:sendto | 31,308 | 81,058 | +2.6× |
-| syscalls:recvfrom | 105,649 | 105,597 | 不变 |
-| syscalls:read | 0 | 30 | ring 路径触发 |
-
----
-
-## 参数选择
-
-| 参数 | 值 | 依据 |
-|------|:--:|------|
-| RING_SIZE | 1,048,576 | 1MB，覆盖微秒级抖动 |
-| fast path 阈值 | 100 帧 | ping-pong 直达，pipeline 切 ring |
-| Send 线程唤醒 | eventfd blocking read | 比 epoll 简化 |
+| 事件 | Phase 4 | Phase 5 rev2 |
+|:----|:-------:|:------------:|
+| IPC（burst）| 1.30 | 1.28 |
+| IPC（sustained）| 0.64 | **0.99** |
+| cache-misses | 9,390,601 | 6,575,277 |
+| sendto/run | 31,308 | 81,058 |
+| recvfrom/run | 105,649 | 105,597 |
+| ctx/s | 50,803 | 50,595 |
 
 ---
 
