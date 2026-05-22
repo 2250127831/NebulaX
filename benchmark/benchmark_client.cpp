@@ -255,7 +255,7 @@ int main(int argc, char* argv[]) {
     tsc_ns();  // prime calibration
 
     const int N_RUNS   = 3;
-    const int64_t TOTAL_CMDS = 500000;
+    const int64_t TOTAL_CMDS = 50000000;
     const int N_NEW    = TOTAL_CMDS * 50 / 100;
     const int N_CANCEL = TOTAL_CMDS * 25 / 100;
     const int N_BOOK   = TOTAL_CMDS * 25 / 100;

@@ -64,7 +64,8 @@ epoll(EPOLLIN)                     eventfd blocking read (唤醒)
 
 | 指标 | Phase 4 | Phase 5 rev2 | Δ |
 |:----|:-------:|:------------:|:-:|
-| **Pipeline QPS** | **7.4M** | **8.5M** | **+15%** |
+| **Pipeline QPS（burst）** | **7.4M** | **8.5M** | **+15%** |
+| **Pipeline QPS（持续 50M）** | **4.1M** | **7.2M** | **+76%** |
 | **Pipeline avg** | 26 ms | 21 ms | -19% |
 | **Ping-pong avg** | 8 µs | **8 µs** | 不变 |
 | **Ping-pong P50** | 8 µs | 8 µs | 不变 |
@@ -99,9 +100,17 @@ epoll(EPOLLIN)                     eventfd blocking read (唤醒)
 
 ## 性能分析
 
-### Pipeline +15% 的来源
+### Pipeline +76%（持续负载）
 
-QPS 从 Phase 4 的 7.4M 提升到 8.5M（+15%），来自 IO 线程去掉了 per-connection 的响应管理开销：
+持续 50M 命令下 Phase 4 QPS 跌至 4.1M（IPC 0.64），Phase 5 rev2 稳定在 7.2M（IPC 0.99）。差距 76%。
+
+原因是 Phase 4 的 `resp_buf` 管理（`emplace_back` / `memmove` / `epoll_ctl`）在长跑中导致内存布局碎片化，cache miss 急剧上升。Phase 5 rev2 去掉了这些 per-connection 状态，路径更短、更可预测。
+
+Burst 500K 下两者差距较小（+15%），因为短时间内存热度高，管理开销未充分暴露。
+
+### 提升来源
+
+Phase 5 rev2 去掉了以下开销：
 
 - **Phase 4**：`handleRead` 后调 `trySendResponses`，涉及 `conn->resp_buf` 的 `emplace_back`、`memmove`（移除已发送帧）、`epoll_ctl(MOD, EPOLLOUT)` 注册注销
 - **Phase 5 rev2**：积累响应到临时 `vector`，ET drain 结束后一次性 `pushResponses`。100 帧阈值让 pipeline 的大批量响应走 ring 路径，Send 线程参与发送
