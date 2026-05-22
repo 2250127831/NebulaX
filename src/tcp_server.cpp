@@ -2,12 +2,16 @@
 
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdint>
 
-TcpServer::TcpServer(int port, MatchingEngine& engine)
-    : port_(port), engine_(engine)
+TcpServer::TcpServer(int port, MatchingEngine& engine,
+                     SPSCByteRing<RING_SIZE>& resp_ring,
+                     int wake_fd)
+    : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd)
 {
     // ── create server socket (non-blocking for ET) ──
     server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -108,16 +112,10 @@ void TcpServer::start()
                 handleAccept();
             } else {
                 auto* conn = static_cast<ConnContext*>(events[i].data.ptr);
-                uint32_t ev = events[i].events;
+                if (conns_.count(conn->fd) == 0) continue;
 
-                // read-side: data / orderly close / error
-                // handleRead 内部处理 recv==0 / recv<0
-                if (ev & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))
+                if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))
                     handleRead(conn);
-
-                // write-side: 只当连接仍存活时才发
-                if (ev & EPOLLOUT && conns_.count(conn->fd))
-                    handleWrite(conn);
             }
         }
     }
@@ -149,10 +147,10 @@ void TcpServer::handleAccept()
 
 void TcpServer::handleRead(ConnContext* conn)
 {
-    // ET: 外层循环确保 kernel buffer 排空到 EAGAIN
-    // 每一轮：recv → 处理 → compact，如果 buffer 满导致 recv 中途退出
-    // 或处理完所有命令后还有空间，继续 recv
+    // ET: do-while 确保 kernel buffer 排空到 EAGAIN
+    // buf 在循环外积累，一批命令的响应一次性推送，减少跨核传输次数
     bool more;
+    std::vector<BinaryResponse> buf;
     do {
         more = false;
 
@@ -165,109 +163,39 @@ void TcpServer::handleRead(ConnContext* conn)
                 conn->pending += n;
                 more = true;
             } else if (n == 0) {
+                if (!buf.empty()) pushResponses(conn->fd, buf);
                 closeConnection(conn);
                 return;
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (!buf.empty()) pushResponses(conn->fd, buf);
                 closeConnection(conn);
                 return;
             }
         }
 
-        // 处理所有完整命令
+        // 处理所有完整命令，响应追加到 buf
         while (conn->pending - conn->consumed >= sizeof(BinaryCommand)) {
             BinaryCommand cmd;
             memcpy(&cmd, conn->read_buf + conn->consumed, sizeof(cmd));
             conn->consumed += sizeof(BinaryCommand);
 
             if (!validateCommand(cmd)) {
-                auto& rsp = conn->resp_buf.emplace_back();
+                auto& rsp = buf.emplace_back();
                 rsp.type = RSP_ERROR;
                 rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_COMMAND_TYPE);
             } else {
-                processRequest(cmd, conn->resp_buf);
+                processRequest(cmd, buf);
             }
             more = true;
         }
 
         conn->compact();
-
-        // more==true: 这轮处理过数据，再试一轮确保 kernel buffer 排空
-        // more==false: 没新数据也没处理任何命令，退出
     } while (more);
 
-    trySendResponses(conn);
-}
-
-void TcpServer::handleWrite(ConnContext* conn)
-{
-    trySendResponses(conn);
-}
-
-void TcpServer::trySendResponses(ConnContext* conn)
-{
-    size_t total = conn->resp_buf.size() * sizeof(BinaryResponse);
-
-    // 如果全部发完了（resp_sent == total），compact 清理已发 frames
-    if (conn->resp_sent > 0 && conn->resp_sent == total) {
-        conn->resp_buf.clear();
-        conn->resp_sent = 0;
-    }
-
-    if (conn->resp_buf.empty()) {
-        if (conn->write_interested) {
-            epoll_event ev;
-            ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-            ev.data.ptr = conn;
-            epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn->fd, &ev);
-            conn->write_interested = false;
-        }
-        return;
-    }
-
-    const char* data = reinterpret_cast<const char*>(conn->resp_buf.data());
-
-    while (conn->resp_sent < total) {
-        ssize_t n = send(conn->fd, data + conn->resp_sent,
-                         total - conn->resp_sent, MSG_NOSIGNAL);
-        if (n > 0) {
-            conn->resp_sent += n;
-        } else if (n == -1 && errno == EAGAIN) {
-            break;
-        } else {
-            closeConnection(conn);
-            return;
-        }
-    }
-
-    // 只移除已完整发送的 frame（resp_sent 可能包含不完整 frame）
-    size_t frames_sent = conn->resp_sent / sizeof(BinaryResponse);
-    if (frames_sent > 0) {
-        size_t remaining = conn->resp_buf.size() - frames_sent;
-        if (remaining > 0) {
-            memmove(conn->resp_buf.data(),
-                    conn->resp_buf.data() + frames_sent,
-                    remaining * sizeof(BinaryResponse));
-        }
-        conn->resp_buf.resize(remaining);
-        conn->resp_sent -= frames_sent * sizeof(BinaryResponse);
-    }
-
-    // 更新 EPOLLOUT 状态
-    bool done = (conn->resp_sent == 0 && conn->resp_buf.empty());
-    if (done && conn->write_interested) {
-        epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-        ev.data.ptr = conn;
-        epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn->fd, &ev);
-        conn->write_interested = false;
-    } else if (!done && !conn->write_interested) {
-        epoll_event ev;
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
-        ev.data.ptr = conn;
-        epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn->fd, &ev);
-        conn->write_interested = true;
-    }
+    // 一次性推送所有积累的响应
+    if (!buf.empty())
+        pushResponses(conn->fd, buf);
 }
 
 void TcpServer::closeConnection(ConnContext* conn)
@@ -276,6 +204,68 @@ void TcpServer::closeConnection(ConnContext* conn)
     close(conn->fd);
     conns_.erase(conn->fd);
     delete conn;
+}
+
+void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
+{
+    size_t count = buf.size();
+    if (count == 0) return;
+
+    size_t bytes = count * sizeof(BinaryResponse);
+
+    // 快速路径：ring 空（Send 线程阻塞在 eventfd）→ 直接 send，绕过 ring
+    if (ring_.free_space() == RING_SIZE) {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
+        size_t sent = 0;
+        int spins = 0;
+        while (sent < bytes) {
+            ssize_t r = send(fd, data + sent, bytes - sent, MSG_NOSIGNAL);
+            if (r > 0) {
+                sent += r;
+                spins = 0;
+            } else if (r == -1 && errno == EAGAIN) {
+                if (sent == 0 && ++spins >= 500) break;
+                __builtin_ia32_pause();
+            } else {
+                return;
+            }
+        }
+        if (sent == bytes) return;
+        if (sent > 0) return;
+    }
+
+    // 正常路径：推 RSP_HEADER + 响应帧到 ring，Send 线程消费
+    BinaryResponse header;
+    header.type = RSP_HEADER;
+    header.data.header.client_fd = fd;
+    header.data.header.count = count;
+
+    while (ring_.push(&header, sizeof(BinaryResponse)) == 0) {
+        notifySendThread();
+        __builtin_ia32_pause();
+    }
+
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(buf.data());
+    size_t remaining = bytes;
+    size_t off = 0;
+    while (remaining > 0) {
+        size_t n = ring_.push(ptr + off, remaining);
+        if (n == 0) {
+            notifySendThread();
+            __builtin_ia32_pause();
+            continue;
+        }
+        off += n;
+        remaining -= n;
+    }
+
+    notifySendThread();
+}
+
+void TcpServer::notifySendThread()
+{
+    uint64_t val = 1;
+    write(wake_fd_, &val, sizeof(val));
 }
 
 void TcpServer::processRequest(const BinaryCommand& cmd, std::vector<BinaryResponse>& out)

@@ -4,6 +4,11 @@ set +m
 
 PORT="${1:-2250}"
 MODE="${2:-}"  # default pipeline, "-r" for pingpong
+
+# 核心分配（P-core 5/6/7，互不重叠）
+IO_CORE=6
+SEND_CORE=7
+CLIENT_CORE=5
 if [ "$MODE" = "-r" ]; then
     MODE_FLAG="-r"
     MODE_NAME="pingpong"
@@ -81,8 +86,9 @@ if [ "$HAS_SUDO" -eq 1 ]; then
     info "kernel.kptr_restrict=0"
 fi
 
-info "启动服务端 nebulaX (core 6, port $PORT) ..."
-taskset -c 6 "$BASE/build/nebulaX" "$PORT" > /dev/null 2>&1 &
+info "启动服务端 nebulaX (IO=core $IO_CORE, Send=core $SEND_CORE, port $PORT) ..."
+taskset -c "$IO_CORE,$SEND_CORE" "$BASE/build/nebulaX" "$PORT" \
+    --io-core "$IO_CORE" --send-core "$SEND_CORE" > /dev/null 2>&1 &
 sleep 2
 
 SERVER_PID=$(pidof nebulaX 2>/dev/null || echo "")
@@ -108,7 +114,7 @@ syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_read \
 fi
 
 CLIENT_TMP=$(mktemp /tmp/nebulaX_client_out.XXXXXX)
-taskset -c 5 "$BASE/benchmark/benchmark_client" 127.0.0.1 "$PORT" $MODE_FLAG > "$CLIENT_TMP" 2>&1
+taskset -c "$CLIENT_CORE" "$BASE/benchmark/benchmark_client" 127.0.0.1 "$PORT" $MODE_FLAG > "$CLIENT_TMP" 2>&1
 echo ""; cat "$CLIENT_TMP"
 
 read -r B_TOTAL B_AVG B_P50 B_P99 B_P999 B_QPS <<< \

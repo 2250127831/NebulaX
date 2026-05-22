@@ -43,6 +43,7 @@ constexpr uint8_t RSP_FILLED    = 0x83;
 constexpr uint8_t RSP_CANCELLED = 0x84;
 constexpr uint8_t RSP_ERROR     = 0x85;
 constexpr uint8_t RSP_BOOK      = 0x86;
+constexpr uint8_t RSP_HEADER   = 0x87;
 
 // ── Error codes ──
 enum class ErrorCode : uint16_t
@@ -89,6 +90,13 @@ struct BinaryResponse
         {
             uint16_t code;
         } error;
+
+        // type == RSP_HEADER (线程间通信：fd + 后续响应帧数)
+        struct
+        {
+            int      client_fd;
+            uint32_t count;
+        } header;
 
         // type == RSP_BOOK
         struct
