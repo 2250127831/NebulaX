@@ -55,12 +55,14 @@ epoll(EPOLLIN)                     eventfd blocking read (唤醒)
 | 指标 | Phase 3 | Phase 4 | Phase 5 rev2 |
 |:----|:-------:|:-------:|:------------:|
 | Pipeline burst (500K) | 1.95M | 7.4M | **8.5M** |
-| Pipeline sustained (50M) | 2.4M | 4.1M | **7.2M** |
+| Pipeline sustained (50M)¹ | 2.4M | 4.1M | **7.2M** |
 | Ping-pong avg | 7µs | 8µs | **8µs** |
 | IPC（burst）| 2.00 | 1.30 | 1.28 |
 | IPC（sustained）| — | 0.64 | **0.99** |
 
 Phase 5 rev2 相比 Phase 4：burst +15%，sustained **+76%**。持续负载下差距远大于 burst，原因是 Phase 4 的 resp_buf 管理在长跑中导致 IPC 从 1.30 跌至 0.64，Phase 5 rev2 稳定在 0.99。
+
+¹ Phase 3 sustained 为 blocking TCP 单连接实测值，代码对应 commit d647799。
 
 ### 逐轮明细
 
