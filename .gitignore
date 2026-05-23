@@ -46,3 +46,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test binaries
+test/test_correctness
+test/test_correctness_asan
