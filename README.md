@@ -4,14 +4,7 @@ C++ 撮合引擎，持续以数据驱动的方式优化高并发低延迟。
 
 ## 架构
 
-```
-Client ──TCP──▶ epoll(EPOLLIN) ──▶ Matching ──▶ SPSC ring ──▶ Send ──▶ TCP
-                    (core 6)     (core 6)      (1MB)        (core 7)
-```
-
-- **IO+Matching (core 6)**：epoll ET 事件循环，recv + 撮合
-- **Send (core 7)**：eventfd 唤醒 → pop ring → 零拷贝 send
-- **自适应快速路径**：小 batch（≤100 帧）IO 直接 send，大 batch 切 ring 并行
+![V2 架构图](docs/images/V2架构图.png)
 
 ### Matching Engine
 
