@@ -69,6 +69,10 @@ int main(int argc, char* argv[])
             }
 
             auto* rsp = reinterpret_cast<BinaryResponse*>(hdr);
+            if (rsp->type == RSP_CLOSE) {
+                close(rsp->data.header.client_fd);
+                continue;
+            }
             if (rsp->type != RSP_HEADER) continue;
 
             int fd = rsp->data.header.client_fd;

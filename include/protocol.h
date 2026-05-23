@@ -44,6 +44,7 @@ constexpr uint8_t RSP_CANCELLED = 0x84;
 constexpr uint8_t RSP_ERROR     = 0x85;
 constexpr uint8_t RSP_BOOK      = 0x86;
 constexpr uint8_t RSP_HEADER   = 0x87;
+constexpr uint8_t RSP_CLOSE    = 0x88;
 
 // ── Error codes ──
 enum class ErrorCode : uint16_t
