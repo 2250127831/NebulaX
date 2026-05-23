@@ -147,9 +147,9 @@ Phase 3 的 `sendto=1,500,600` 来自逐条 `send()`。epoll reactor 将一批 r
 |------|:-------:|:----------------:|:----------------:|
 | Ping-pong | 124,198 ctx/s | 115,615 ctx/s | — |
 | Pipeline（burst 500K）| 653 | 1,716 | 50,803 |
-| Pipeline（sustained 50M）| — | — | 614 |
+| Pipeline（sustained 50M）| 393 | — | 614 |
 
-Burst 下 ctx/s 50,803（进程级 `perf stat -p`），sustained 50M 下仅 614——长时间运行中上下文切换被分摊。
+Burst 下 ctx/s 50,803（进程级 `perf stat -p`），sustained 50M 下 Phase 3 仅 393（blocking TCP 单连接无调度干扰），Phase 4 为 614。
 
 ### IPC
 
@@ -157,9 +157,9 @@ Burst 下 ctx/s 50,803（进程级 `perf stat -p`），sustained 50M 下仅 614�
 |------|:-------:|:----------------:|:----------------:|
 | Ping-pong | 1.39 | 1.64 | — |
 | Pipeline（burst 500K）| 2.00 | 1.11 | **1.30** |
-| Pipeline（sustained 50M）| — | — | 0.64 |
+| Pipeline（sustained 50M）| 1.87（2.09M QPS）| — | 0.64 |
 
-Burst 下多连接 IPC 从 1.11 提升到 1.30。Sustained 50M 负载下 IPC 跌至 0.64——`resp_buf` 的管理开销（memmove、vector resize、epoll_ctl）在长时间运行中积累了大量 cache miss。Phase 5 rev2 解决了这个问题（sustained IPC 0.99），详见对应报告。
+Burst 下多连接 IPC 从 1.11 提升到 1.30。Sustained 50M 负载下 Phase 3 仍维持 1.87（blocking TCP 路径简单），Phase 4 跌至 0.64——`resp_buf` 的管理开销（memmove、vector resize、epoll_ctl）在长时间运行中积累了大量 cache miss。Phase 5 rev2 解决了这个问题（sustained IPC 0.99），详见对应报告。
 
 ### syscall 不对称
 
