@@ -35,7 +35,7 @@
 
 | 指标 | Phase 3 (blocking) | Phase 4 (epoll, 1 conn) | Phase 4 (epoll, 4 conn) | Δ (1→4 conn) |
 |------|:------------------:|:-----------------------:|:-----------------------:|:------------:|
-| **Pipeline QPS¹** | 1,954,005 | 6,349,612 | **7,403,743** | **+17%** |
+| **Pipeline QPS** | 1,954,005 | 6,349,612 | **7,403,743** | **+17%** |
 | **Pipeline avg** | 33 ms | 52 ms | 24 ms | 因连接数不同不可比 |
 | **Ping-pong avg** | 7 µs | 8 µs | — | +1 µs（ET drain 开销） |
 | **Ping-pong P50** | 7 µs | 8 µs | — | +1 µs |
@@ -45,7 +45,7 @@
 | **IPC (pipeline)** | 2.00 | 1.11 | 1.30 | 瓶颈从 syscall 转向计算 |
 | **cycles (pipeline)** | 3,092M | 997M | 1,340M | 总运算量大幅下降 |
 
-> ¹ QPS 修正：原记录 13,504,712 系 `Σ(count_i/wall_i)` 求和算法虚高。实测修正为 `total_cmds/max_wall_us` 后为 **7,403,743**。多连接持续负载（50M）下 QPS **4,144,921**（IPC 0.64）。详见 Phase 5 rev2 报告。
+> QPS 修正：原记录 13,504,712 系 `Σ(count_i/wall_i)` 求和算法虚高。实测修正为 `total_cmds/max_wall_us` 后为 **7,403,743**。多连接持续负载（50M）下 QPS **4,144,921**（IPC 0.64）。详见 Phase 5 rev2 报告。
 
 ### 逐轮明细
 
@@ -88,7 +88,7 @@
 |------|:-----------:|---------|
 | Phase 3 二进制协议 | 1,954,005 | 基线 |
 | + epoll ET reactor | 6,349,612 | sendto 从 1.5M 降至 743，瓶颈从 IO 移到撮合 |
-| + 多连接（4 conns）¹ | 7,403,743 | 多路并发消除 epoll 空转，CPU 利用率更饱和 |
+| + 多连接（4 conns）  | 7,403,743 | 多路并发消除 epoll 空转，CPU 利用率更饱和 |
 
 ### 为什么多连接有额外收益？
 
@@ -146,18 +146,20 @@ Phase 3 的 `sendto=1,500,600` 来自逐条 `send()`。epoll reactor 将一批 r
 | 模式 | Phase 3 | Phase 4 (1 conn) | Phase 4 (4 conn) |
 |------|:-------:|:----------------:|:----------------:|
 | Ping-pong | 124,198 ctx/s | 115,615 ctx/s | — |
-| Pipeline | 653 ctx/s | 1,716 ctx/s | 54,100 ctx/s |
+| Pipeline（burst 500K）| 653 | 1,716 | 50,803 |
+| Pipeline（sustained 50M）| — | — | 614 |
 
-Pipeline 多连接下 ctx/s 大幅上升（54,100），但这是因为客户端 4 连接 × 2 线程 = 8 个线程争调度，服务器侧的上下文切换仍然很低。perf 统计的是系统总 ctx/s，包含所有进程。
+Burst 下 ctx/s 50,803（进程级 `perf stat -p`），sustained 50M 下仅 614——长时间运行中上下文切换被分摊。
 
 ### IPC
 
 | 模式 | Phase 3 | Phase 4 (1 conn) | Phase 4 (4 conn) |
 |------|:-------:|:----------------:|:----------------:|
 | Ping-pong | 1.39 | 1.64 | — |
-| Pipeline | 2.00 | 1.11 | 1.39 |
+| Pipeline（burst 500K）| 2.00 | 1.11 | **1.30** |
+| Pipeline（sustained 50M）| — | — | 0.64 |
 
-Pipeline 下 IPC 下降符合预期——瓶颈从高 IPC 的 string 操作（Phase 3 中 locale 部分 IPC 高）转移到低 IPC 的 kernel 路径和缓存未命中。多连接 IPC 略高于单连接（1.39 vs 1.11），因为流水线更满。
+Burst 下多连接 IPC 从 1.11 提升到 1.30。Sustained 50M 负载下 IPC 跌至 0.64——`resp_buf` 的管理开销（memmove、vector resize、epoll_ctl）在长时间运行中积累了大量 cache miss。Phase 5 rev2 解决了这个问题（sustained IPC 0.99），详见对应报告。
 
 ### syscall 不对称
 
@@ -178,7 +180,7 @@ Phase 4 epoll reactor 达到了预定的两个目标：
 
 2. **攒批发送消除 IO 瓶颈。** sendto 从 150 万次降至 743 次（-99.95%），火焰图上 send 路径占比从 75% 降至 4.6%。Pipeline 吞吐从 195 万 QPS 提升到 635 万 QPS，瓶颈从 IO 转移到撮合逻辑。
 
-3. **多连接消除 epoll 空转。** 4 连接并发将 QPS 推至 740 万，原因是多路数据流天然错开，消除了 epoll 空转等待。¹
+3. **多连接消除 epoll 空转。** 4 连接并发将 QPS 推至 740 万，原因是多路数据流天然错开，消除了 epoll 空转等待。 
 
 4. **Ping-pong 延迟基本不变。** 单笔交互延迟从 7µs 变为 8µs，退化为 +1µs。原因已明确——ET drain 循环需要额外一次 `recv()` 确认 EAGAIN，多连接场景下这个开销被分摊。
 
