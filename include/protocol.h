@@ -53,6 +53,7 @@ enum class ErrorCode : uint16_t
     INVALID_PRICE_QTY_USER = 2,
     ORDER_NOT_FOUND        = 3,
     INVALID_COMMAND_TYPE   = 4,
+    POOL_FULL              = 5,
 };
 
 // ── Binary response: 48 bytes, fixed size ──

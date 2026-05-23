@@ -44,10 +44,15 @@ void MatchingEngine::processNewOrder(
     if (order.status == OrderStatus::OPEN ||
         order.status == OrderStatus::PARTIALLY_FILLED)
     {
-        order_book_.addOrder(order);
-        auto& rsp = out.emplace_back();
-        rsp.type = RSP_OK;
-        rsp.data.ack.order_id = order.order_id;
+        if (!order_book_.addOrder(order)) {
+            auto& rsp = out.emplace_back();
+            rsp.type = RSP_ERROR;
+            rsp.data.error.code = static_cast<uint16_t>(ErrorCode::POOL_FULL);
+        } else {
+            auto& rsp = out.emplace_back();
+            rsp.type = RSP_OK;
+            rsp.data.ack.order_id = order.order_id;
+        }
     }
     else if (order.status == OrderStatus::FILLED)
     {
@@ -121,7 +126,7 @@ void MatchingEngine::matchBuyOrder(Order& order, std::vector<BinaryResponse>& ou
         {
             best_ask->status = OrderStatus::FILLED;
             // removeOrder 后 best_ask 悬空，循环顶部重新获取
-            order_book_.removeOrder(best_ask->order_id, best_ask->user_id);
+            order_book_.removeOrder(best_ask);
         }
         else
         {
@@ -166,7 +171,7 @@ void MatchingEngine::matchSellOrder(Order& order, std::vector<BinaryResponse>& o
         if (best_bid->remaining_qty == 0)
         {
             best_bid->status = OrderStatus::FILLED;
-            order_book_.removeOrder(best_bid->order_id, best_bid->user_id);
+            order_book_.removeOrder(best_bid);
         }
         else
         {

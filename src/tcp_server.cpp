@@ -200,20 +200,23 @@ void TcpServer::handleRead(ConnContext* conn)
 
 void TcpServer::closeConnection(ConnContext* conn)
 {
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, conn->fd, nullptr);
-    conns_.erase(conn->fd);
-    delete conn;
+    int fd = conn->fd;
 
-    // 通知 Send 线程关闭 fd（确保所有排队的响应已发完再关）
+    // 先通知 Send 线程关闭 fd（确保所有排队的响应已发完再关）
     BinaryResponse frame;
     frame.type = RSP_CLOSE;
-    frame.data.header.client_fd = conn->fd;
+    frame.data.header.client_fd = fd;
     frame.data.header.count = 0;
     while (ring_.push(&frame, sizeof(BinaryResponse)) == 0) {
         notifySendThread();
         __builtin_ia32_pause();
     }
     notifySendThread();
+
+    // 再清理 IO 线程资源
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    conns_.erase(fd);
+    delete conn;
 }
 
 void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
