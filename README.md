@@ -74,11 +74,11 @@ sudo bash ./scripts/nebulaX_bench.sh -r      # ping-pong 模式
 
 | 阶段 | 内容 | 状态 |
 |:----|------|:----:|
-| Phase 3 | 二进制协议 + 批量收发 | ✅ |
-| Phase 4 | epoll ET reactor + 多连接 | ✅ |
-| Phase 5 rev2 | 双线程 + SPSC byte ring + 快速路径 | ✅ |
-| Phase 6 | 内存池 + 平坦数据结构 | ⏳ |
-| Phase 7 | io_uring | 📅 |
+| Phase 3 | 二进制协议 + 批量收发 | 已完成 |
+| Phase 4 | epoll ET reactor + 多连接 | 已完成 |
+| Phase 5 rev2 | 双线程 + SPSC byte ring + 快速路径 | 已完成 |
+| Phase 6 | 内存池 + 平坦数据结构 | 进行中 |
+| Phase 7 | io_uring | 待开始 |
 
 ## 环境
 
