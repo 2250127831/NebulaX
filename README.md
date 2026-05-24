@@ -72,6 +72,7 @@ sudo bash ./scripts/nebulaX_bench.sh -r      # ping-pong 模式
 
 | 阶段 | 内容 | 状态 |
 |:----|------|:----:|
+| V1 | 纯文本协议基线 | 已完成 |
 | Phase 3 | 二进制协议 + 批量收发 | 已完成 |
 | Phase 4 | epoll ET reactor + 多连接 | 已完成 |
 | Phase 5 rev2 | 双线程 + SPSC byte ring + 快速路径 | 已完成 |
