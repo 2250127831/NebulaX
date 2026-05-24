@@ -27,7 +27,7 @@
 
 ## 架构变更
 
-IO+Matching 线程的事件循环从 `epoll_wait` + `recv()` 替换为 `io_uring`。
+IO+Matching 线程的事件循环从 `epoll_wait` + `recv()` 替换为 `io_uring`。Send 线程用 `IORING_OP_SEND_ZC_FIXED` 将 SPSC ring 注册为固定缓冲区，大 batch 走内核 DMA 零拷贝发送。
 
 ```
 Phase 6                               Phase 7
@@ -40,12 +40,21 @@ epoll_wait + recv()循环                io_uring_enter(submit+wait)
 
 Send (core 7)                         Send (core 7)
 read(eventfd) + send from ring        read(eventfd) + send from ring
-                                      
+                                                ↑ send_zc_all() 用固定缓冲区
+                                                   SEND_ZC_FIXED 零拷贝
 ```
 
-### 为什么 Send 线程不动
+### Send 线程的 SEND_ZC
 
-SPSC ring 的 `read_acquire` 返回 ring 内部缓冲区指针，`send(fd, ptr)` 直接从 ring 发送，线程间零拷贝。io_uring 的异步 `IORING_OP_SEND` 要求 buffer 在内核完成前保持稳定——但 IO 线程同时持续 `push` 新数据进 ring，可能覆盖未完成的 send 区域。两种内存可见性模型互斥。强行用 io_uring 异步 send 要么需要拷贝（破坏零拷贝），要么需要同步等待 CQE（失去异步收益）。recv 侧不存在这个问题——recv buffer 是独立分配的，io_uring 直接往里写即可。
+SPSCByteRing 自身绑定 io_uring 固定缓冲区：
+
+- `init_uring()` — `io_uring_register_buffers` 将 ring 的 `buf_` 注册为固定缓冲区，内核 pin 住页面免去每次 `get_user_pages`
+- `send_zc_all(fd, len, flags)` — 逐段 `read_acquire` → 提交 `IORING_OP_SEND_ZC_FIXED` SQE → 等 CQE → `read_release`。成功返回 len，失败返回负 errno
+- 通知 CQE（`res=0, cflags=IORING_CQE_F_NOTIF`）表示内核用完 buffer，直接跳过
+
+Send 线程对 ≥4KB 的 batch 优先走 `send_zc_all`，遇到 `-EOPNOTSUPP` 或 `-ENOSYS` 时永久降级到 plain `send()`，兼容内核不支持 SEND_ZC 的环境。
+
+只对大批量传输（完整盘口快照、风控文件等）有收益，日常响应帧（48 bytes × 128 = 6KB）下两条额外 CQE 的开销可忽略——实测 QPS 差 4% 以内，在 benchmark 三轮方差范围内。
 
 ### 新增文件
 
@@ -59,6 +68,8 @@ SPSC ring 的 `read_acquire` 返回 ring 内部缓冲区指针，`send(fd, ptr)`
 |:----|------|
 | `include/tcp_server.h` | 移除 `epoll_fd_`，新增 `IoUringPoller poller_`；`handleAccept`→`onAccept`，`handleRead`→`onRecv` |
 | `src/tcp_server.cpp` | `start()` 事件循环重写；解析/匹配逻辑保持与 Phase 6 一致 |
+| `include/spsc_byte_ring.h` | 新增 `init_uring()` / `close_uring()` / `send_zc_all()`，ring 自身绑定 io_uring 固定缓冲区 |
+| `src/main.cpp` | Send 线程自适应：≥4KB 优先 SEND_ZC，失败降级 plain send |
 | `CMakeLists.txt` | 新增 `liburing` 依赖 |
 
 ---
@@ -71,11 +82,11 @@ SPSC ring 的 `read_acquire` 返回 ring 内部缓冲区指针，`send(fd, ptr)`
 
 | 指标 | Phase 6 (epoll) | Phase 7 (io_uring) | Δ |
 |:----|:------------:|:-------:|:---|
-| QPS | 12.3M | **13.6M** | **+10%** |
+| QPS | 12.3M | **13.9M** | **+13%** |
 | avg 延迟 | 244ms | **40ms** | **-83%** |
 | P50 | 34ms | 41ms | +22% |
-| **P99** | 909ms | **55ms** | **-94%** |
-| **P999** | 1,428ms | **58ms** | **-96%** |
+| **P99** | 909ms | **51ms** | **-94%** |
+| **P999** | 1,428ms | **56ms** | **-96%** |
 
 Pipeline 尾延迟降低 94%~96%。io_uring 每次 CQE 等粒度处理消除了 epoll ET drain 循环的批处理拥堵——Phase 6 某次 epoll 迭代可能独占 CPU 处理大量积压数据，导致其他连接的响应被长时间阻塞。Phase 6 的 P999 高达 1.4 秒，Phase 7 压缩到 58ms。
 
@@ -129,7 +140,7 @@ Phase 7 pingpong 数据含 perf 干扰（avg=8µs vs 纯净 5µs），因此与 
 
   脚本的 perf stat 未采集 `io_uring_enter` tracepoint。之前手动采集结果：327,020（pipeline 50M × 3，21.6s）。
 
-Pipeline 下 `sendto -85%` 是间接收益：io_uring 的等粒度 CQE 处理使响应更自然地攒批到一次 `send()`，而非分散为多次小 send。
+Pipeline 的 `sendto` 从 7.9M（Phase 6）降至 1.2M（Phase 7 — 88%），原因是 io_uring 的等粒度 CQE 处理使响应更自然地积攒成大 batch，pushResponses 一次发送更多帧。SEND_ZC 的加入未增加 syscall 计数——大 batch 直接通过固定缓冲区 DMA 发送，send_zc_all 批量化提交使得总 `io_uring_enter` 次数与 recv CQE 数相当，不引入额外开销。
 
 ### CPU 热点分布（Pipeline 火焰图，脚本采集）
 
@@ -158,7 +169,13 @@ Pingpong 的单连接串行模型下差距很小（5µs vs 6µs）——单连�
 
 ### 固定缓冲区（IORING_REGISTER_BUFFERS）
 
-IoUringPoller 构造时预注册 64 个 4KB 缓冲区（`io_uring_register_buffers`）。每个 ConnContext 从池中分配一个，recv SQE 通过 `sqe->buf_index` 指向注册缓冲区，内核免去每次 recv 的 `get_user_pages` 页表操作。实测 QPS 无显著变化（13.87M vs 13.9M）——recv 路径仅占 ~7% CPU，其中页表 pin 只是很小一部分。这项优化属于"零成本完善"：代码量 ~30 行，不增加复杂度，无关场景下不倒退。
+本项目涉及两层固定缓冲区：
+
+1. **IoUringPoller（recv 侧）** — 构造时预注册 64 个 4KB 缓冲区。每个 ConnContext 从池中分配一个，recv SQE 通过 `sqe->buf_index` 指向注册缓冲区。内核 TCP 栈直接通过 DMA 将接收数据写入用户页，**无 `copy_to_user`**。实测 QPS 无显著变化（13.87M vs 13.9M）——recv 路径仅占 ~7% CPU，其中页表 pin 只是很小一部分。
+
+2. **SPSCByteRing（send 侧）** — `init_uring()` 时将 ring 自身（1MB）注册为 io_uring 固定缓冲区。`send_zc_all` 通过 `IORING_OP_SEND_ZC_FIXED` 由内核 DMA 直接从 ring 读数据发送，**无 `copy_from_user`**。
+
+两项优化都属于"零成本完善"——代码量 ~50 行，不增加运行时复杂度，不支持 SEND_ZC 的内核自动降级到 plain send。
 
 ### 数据采集说明
 

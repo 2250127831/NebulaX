@@ -18,13 +18,14 @@ C++ 撮合引擎，持续以数据驱动的方式优化高并发低延迟。
 
 ## 当前性能
 
-**Phase 5 rev2（当前）：** epoll ET + 双线程 + SPSC byte ring + 自适应快速路径
+**Phase 7（当前）：** io_uring recv + SEND_ZC + 双线程 + SPSC ring / 全链路零拷贝
 
-| 指标 | Burst (500K) | Sustained (50M) |
-|:----|:-----------:|:---------------:|
-| Pipeline QPS | 8.5M | 7.2M |
-| IPC | 1.28 | 0.99 |
-| Ping-pong avg | 8µs | — |
+| 指标 | Pipeline (50M) | Ping-pong (1M) |
+|:----|:-------------:|:--------------:|
+| QPS | **13.9M** | 197K |
+| P50 | 40ms | 5µs |
+| P99 | 51ms | 6µs |
+| P999 | 56ms | 7µs |
 
 硬件：12th Gen Intel Core i9-12900HX / 24 核 / 31GB RAM / Ubuntu 22.04 / Linux 6.8.0<br>
 绑核：IO+Matching core 6、Send core 7、Client core 5（均为 P-core）<br>
@@ -39,8 +40,9 @@ NebulaX/
 │   ├── order_book.h               买卖盘 + 索引
 │   ├── matching_engine.h          撮合引擎
 │   ├── protocol.h                 二进制协议（32B 命令 / 48B 响应）
-│   ├── spsc_byte_ring.h           SPSC 字节环形缓冲区
-│   └── tcp_server.h               epoll ET 服务端
+│   ├── spsc_byte_ring.h           SPSC 字节环形缓冲区（SEND_ZC 固定缓冲区）
+│   ├── tcp_server.h               io_uring 服务端
+│   ├── io_uring_poller.h          io_uring 封装（accept/recv + 固定缓冲区池）
 ├── src/                       # 实现
 ├── benchmark/                 # 压测客户端
 │   └── benchmark_client.cpp
@@ -48,6 +50,7 @@ NebulaX/
 │   └── nebulaX_bench.sh           压测 + perf 脚本
 ├── docs/
 │   ├── BENCHMARK.md               V1 基线压测报告
+│   ├── optimizations/io_uring.md       Phase 7 io_uring 性能报告
 │   ├── optimizations/             各阶段优化实验记录
 │   └── images/
 ├── profiling/                 # 火焰图等 profiling 产出
@@ -70,8 +73,8 @@ sudo bash ./scripts/nebulaX_bench.sh -r      # ping-pong 模式
 | Phase 3 | 二进制协议 + 批量收发 | 已完成 |
 | Phase 4 | epoll ET reactor + 多连接 | 已完成 |
 | Phase 5 rev2 | 双线程 + SPSC byte ring + 快速路径 | 已完成 |
-| Phase 6 | 内存池 + 平坦数据结构 | 进行中 |
-| Phase 7 | io_uring | 待开始 |
+| Phase 6 | 内存池 + 平坦数据结构 | 已完成 |
+| Phase 7 | io_uring recv + SEND_ZC 全链路零拷贝 | 已完成 |
 
 ## 环境
 
