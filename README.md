@@ -4,7 +4,45 @@ C++ 撮合引擎，持续以数据驱动的方式优化高并发低延迟。
 
 ## 架构
 
-![V2 架构图](docs/images/V2架构图.png)
+```
+                        TCP                          ┌──────────────┐
+  ┌──────────────┐  ──────────►  ┌──────────────┐    │  Matching    │
+  │   Client     │               │ IO+Matching  │───►│  Engine      │
+  │  (core 5)    │◄──────────────│  (core 6)    │    │              │
+  │              │  responses    │              │    │  OrderPool   │
+  │  4 conns     │               │ io_uring     │    │  OrderMap    │
+  │  128 batch   │               │  ├─ accept   │    │  OrderBook   │
+  └──────────────┘               │  └─ recv     │    └──────────────┘
+                                 └──────┬───────┘           │
+                                        │ pushResponses     │
+                              ┌─────────┴──────────┐       │
+                              │ count ≤ 100         │       │
+                              │ && ring empty?      │       │
+                              └────┬──────┬─────────┘       │
+                                   │ NO   │ YES             │
+                                   │      └──► send()       │
+                                   │        直接发送         │
+                                   │                        │
+                              write│eventfd                 │
+                                   │                        │
+                              ┌────▼────────┐               │
+                              │  Send Thread│               │
+                              │  (core 7)   │               │
+                              │             │               │
+                              │ eventfd read│               │
+                              │ ring.pop    │◄── SPSC Ring ─┘
+                              │    │        │   (1MB)
+                              │    ▼        │
+                              │ send batch  │
+                              │ ┌────┴──┐   │
+                              │ │≥4KB   │   │
+                              │ │SEND_ZC│   │
+                              │ │零拷贝   │   │
+                              │ │<4KB   │   │
+                              │ │send() │   │
+                              │ └───────┘   │
+                              └─────────────┘
+```
 
 ### Matching Engine
 
