@@ -88,7 +88,13 @@ Send 线程对 ≥4KB 的 batch 优先走 `send_zc_all`，遇到 `-EOPNOTSUPP` �
 | **P99** | 973ms | **51ms** | **-95%** |
 | **P999** | 1,326ms | **56ms** | **-96%** |
 
-Pipeline 尾延迟降低 94%~96%。io_uring 每次 CQE 等粒度处理消除了 epoll ET drain 循环的批处理拥堵——Phase 6 某次 epoll 迭代可能独占 CPU 处理大量积压数据，导致其他连接的响应被长时间阻塞。Phase 6 的 P999 高达 1.4 秒，Phase 7 压缩到 58ms。
+Pipeline 尾延迟降低 94%~96%。Phase 6 的尾延迟来自两个因素：
+
+1. **epoll ET drain 循环。** Phase 6 某次 epoll 迭代可能独占 CPU 处理大量积压数据，其他连接的响应排队等待。Phase 6 的 P999 高达 1.4 秒。
+
+2. **SPSC ring（1MB）压力。** Phase 6 将 QPS 从 Phase 5 rev2 的 7.2M 推到 12.2M（+70%），更高的吞吐使 1MB ring 在 pushResponses 中更频繁达到满状态，IO 线程在等 ring 空间。实测将 ring 扩至 8MB 后 Phase 6 P999 从 1,326ms 降至 774ms（-42%）。Phase 5 rev2（7.2M QPS）ring 压力小，P999 仅 75ms。
+
+io_uring 每次 CQE 等粒度处理从根本上切断了 epoll 的批处理堆积，而独立 Send 线程从 ring 消费的节奏不受 IO 线程影响。Phase 7 的 P999 压缩到 56ms。
 
 #### Pingpong（1M × 3，单连接，纯净无 perf）
 
