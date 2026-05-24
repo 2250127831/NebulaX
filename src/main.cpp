@@ -33,6 +33,9 @@ int main(int argc, char* argv[])
     MatchingEngine engine;
     SPSCByteRing<RING_SIZE> ring;
 
+    // 尝试初始化 io_uring SEND_ZC（失败不致命，后续降级到 plain send）
+    bool zc_ok = ring.init_uring();
+
     int wake_fd = eventfd(0, 0);
     if (wake_fd < 0) {
         write(STDERR_FILENO, "ERROR: eventfd() failed\n", 24);
@@ -79,6 +82,19 @@ int main(int argc, char* argv[])
             uint32_t count = rsp->data.header.count;
 
             size_t need = count * sizeof(BinaryResponse);
+
+            if (zc_ok && need >= 4096) {
+                // 大块数据走 SEND_ZC
+                ssize_t r = ring.send_zc_all(fd, need, MSG_NOSIGNAL);
+                if (r == -EOPNOTSUPP || r == -ENOSYS)
+                    zc_ok = false;           // 内核不支持，降级到 plain send
+                else if (r < 0)
+                    continue;                // 连接断开，取下一条
+                else
+                    continue;                // 发送完成
+            }
+
+            // plain send 路径
             size_t sent = 0;
             while (sent < need) {
                 const void* ptr;
