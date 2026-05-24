@@ -18,7 +18,7 @@ C++ 撮合引擎，持续以数据驱动的方式优化高并发低延迟。
 
 ## 当前性能
 
-**Phase 7（当前）：** io_uring recv + SEND_ZC + 双线程 + SPSC ring / 全链路零拷贝
+**Phase 7（当前）：** io_uring recv + SEND_ZC + 双线程 + SPSC ring，recv/send 零拷贝
 
 | 指标 | Pipeline (50M) | Ping-pong (1M) |
 |:----|:-------------:|:--------------:|
@@ -76,7 +76,7 @@ sudo bash ./scripts/nebulaX_bench.sh -r      # ping-pong 模式
 | Phase 4 | epoll ET reactor + 多连接 | 已完成 |
 | Phase 5 rev2 | 双线程 + SPSC byte ring + 快速路径 | 已完成 |
 | Phase 6 | 内存池 + 平坦数据结构 | 已完成 |
-| Phase 7 | io_uring recv + SEND_ZC 全链路零拷贝 | 已完成 |
+| Phase 7 | io_uring recv + SEND_ZC，recv/send 零拷贝 | 已完成 |
 
 ## 环境
 
