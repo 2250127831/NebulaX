@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "spsc_byte_ring.h"
+#include "io_uring_poller.h"
 #include "matching_engine.h"
 #include "protocol.h"
 
@@ -14,10 +15,10 @@ constexpr size_t RING_SIZE = 1048576;  // 1 MB
 struct ConnContext
 {
     int fd;
-    static constexpr size_t BUF_SIZE = 4096;
-    char read_buf[BUF_SIZE];
-    size_t pending = 0;    // 缓冲区中有效字节数
-    size_t consumed = 0;   // 已解析的字节偏移
+    char* read_buf = nullptr;  // 指向 io_uring 固定缓冲区
+    uint32_t buf_idx = UINT32_MAX;  // 固定缓冲区索引，用于 re-arm recv
+    size_t pending = 0;
+    size_t consumed = 0;
 
     void compact()
     {
@@ -41,12 +42,16 @@ public:
 
     ~TcpServer();
 
-    // epoll 事件循环（仅处理 EPOLLIN）
+    // io_uring 事件循环
     void start();
 
 private:
-    void handleAccept();
-    void handleRead(ConnContext* conn);
+    // 新连接到达（由 io_uring accept CQE 触发）
+    void onAccept(int client_fd);
+
+    // recv 完成：bytes_read 是从 io_uring CQE 获取的读取字节数
+    void onRecv(ConnContext* conn, int bytes_read);
+
     void closeConnection(ConnContext* conn);
     void pushResponses(int fd, const std::vector<BinaryResponse>& buf);
     void notifySendThread();
@@ -59,11 +64,10 @@ private:
 private:
     int port_ = 0;
     int server_fd_ = -1;
-    int epoll_fd_ = -1;
     MatchingEngine& engine_;
     SPSCByteRing<RING_SIZE>& ring_;
     int wake_fd_ = -1;
 
-    static constexpr int MAX_EVENTS = 64;
+    IoUringPoller poller_;
     std::unordered_map<int, ConnContext*> conns_;
 };

@@ -103,6 +103,10 @@ public:
         return N - (t - h);
     }
 
+    // ring 缓冲区地址（用于 io_uring 注册为固定缓冲区）
+    uint8_t* raw_buffer() { return buf_; }
+    size_t   raw_size() const { return N; }
+
 private:
     alignas(64) std::atomic<size_t> tail_{0};
     alignas(64) std::atomic<size_t> head_{0};

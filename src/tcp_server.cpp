@@ -1,8 +1,6 @@
 #include "tcp_server.h"
 
 #include <sys/socket.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cerrno>
@@ -13,7 +11,7 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
                      int wake_fd)
     : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd)
 {
-    // ── create server socket (non-blocking for ET) ──
+    // ── create server socket (non-blocking) ──
     server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (server_fd_ < 0) {
         write(STDERR_FILENO, "ERROR: socket() failed\n", 23);
@@ -41,23 +39,8 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
         return;
     }
 
-    // ── create epoll fd ──
-    epoll_fd_ = epoll_create1(0);
-    if (epoll_fd_ < 0) {
-        write(STDERR_FILENO, "ERROR: epoll_create1() failed\n", 30);
-        close(server_fd_);
-        server_fd_ = -1;
-        return;
-    }
-
-    // register server socket（ET）
-    epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.fd = server_fd_;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev) < 0) {
-        write(STDERR_FILENO, "ERROR: epoll_ctl ADD server failed\n", 35);
-        close(epoll_fd_);
-        epoll_fd_ = -1;
+    if (!poller_.ok()) {
+        write(STDERR_FILENO, "ERROR: io_uring_queue_init() failed\n", 37);
         close(server_fd_);
         server_fd_ = -1;
         return;
@@ -81,119 +64,100 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
 TcpServer::~TcpServer()
 {
     for (auto& [fd, conn] : conns_) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         close(fd);
         delete conn;
     }
     conns_.clear();
-    if (epoll_fd_ >= 0) close(epoll_fd_);
     if (server_fd_ >= 0) close(server_fd_);
 }
 
 void TcpServer::start()
 {
-    if (server_fd_ < 0 || epoll_fd_ < 0) {
+    if (server_fd_ < 0) {
         write(STDERR_FILENO, "ERROR: server not initialized\n", 30);
         return;
     }
 
-    epoll_event events[MAX_EVENTS];
+    // 初始提交 accept SQE
+    poller_.submit_accept(server_fd_);
 
     while (true) {
-        int nfds = epoll_wait(epoll_fd_, events, MAX_EVENTS, -1);
-        if (nfds < 0) {
+        int ret = poller_.submit_and_wait();
+        if (ret < 0) {
             if (errno == EINTR) continue;
-            write(STDERR_FILENO, "ERROR: epoll_wait() failed\n", 27);
+            write(STDERR_FILENO, "ERROR: io_uring_submit_and_wait() failed\n", 42);
             break;
         }
 
-        for (int i = 0; i < nfds; ++i) {
-            if (events[i].data.fd == server_fd_) {
-                handleAccept();
-            } else {
-                auto* conn = static_cast<ConnContext*>(events[i].data.ptr);
-                if (conns_.count(conn->fd) == 0) continue;
+        poller_.process_cqes(server_fd_,
+            // on_accept: 新连接到达
+            [this](int client_fd) {
+                onAccept(client_fd);
+                // 重新提交 accept SQE 以接收下一个连接
+                poller_.submit_accept(server_fd_);
+            },
+            // on_recv: 客户端数据到达
+            [this](int fd, int bytes_read) {
+                auto it = conns_.find(fd);
+                if (it == conns_.end()) return;
+                auto* conn = it->second;
 
-                if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP))
-                    handleRead(conn);
+                onRecv(conn, bytes_read);
+
+                // onRecv 可能已关闭连接，需再次查找
+                auto it2 = conns_.find(fd);
+                if (it2 != conns_.end())
+                    poller_.submit_recv(fd, it2->second->buf_idx);
             }
-        }
+        );
     }
 }
 
-void TcpServer::handleAccept()
+void TcpServer::onAccept(int client_fd)
 {
-    while (true) {
-        sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        int client_fd = accept4(server_fd_, (sockaddr*)&addr, &len,
-                                SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            write(STDERR_FILENO, "ERROR: accept4() failed\n", 24);
-            break;
-        }
-
-        auto* conn = new ConnContext{};
-        conn->fd = client_fd;
-        conns_[client_fd] = conn;
-
-        epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-        ev.data.ptr = conn;
-        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
+    uint32_t buf_idx = poller_.alloc_buffer();
+    if (buf_idx == UINT32_MAX) {
+        close(client_fd);
+        return;
     }
+
+    auto* conn = new ConnContext{};
+    conn->fd = client_fd;
+    conn->buf_idx = buf_idx;
+    conn->read_buf = poller_.buffer_ptr(buf_idx);
+    conns_[client_fd] = conn;
+
+    poller_.submit_recv(client_fd, buf_idx);
 }
 
-void TcpServer::handleRead(ConnContext* conn)
+void TcpServer::onRecv(ConnContext* conn, int bytes_read)
 {
-    // ET: do-while 确保 kernel buffer 排空到 EAGAIN
-    // buf 在循环外积累，一批命令的响应一次性推送，减少跨核传输次数
-    bool more;
+    if (bytes_read <= 0) {
+        closeConnection(conn);
+        return;
+    }
+
+    conn->pending += bytes_read;
+
     std::vector<BinaryResponse> buf;
-    do {
-        more = false;
 
-        // recv: 读到 EAGAIN 或 buffer 满
-        while (true) {
-            size_t free = sizeof(conn->read_buf) - conn->pending;
-            if (free == 0) break;  // 满了，先处理腾空间
-            ssize_t n = recv(conn->fd, conn->read_buf + conn->pending, free, 0);
-            if (n > 0) {
-                conn->pending += n;
-                more = true;
-            } else if (n == 0) {
-                if (!buf.empty()) pushResponses(conn->fd, buf);
-                closeConnection(conn);
-                return;
-            } else {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                if (!buf.empty()) pushResponses(conn->fd, buf);
-                closeConnection(conn);
-                return;
-            }
+    // 解析所有完整命令，与 Phase 6 handleRead 的解析循环相同
+    while (conn->pending - conn->consumed >= sizeof(BinaryCommand)) {
+        BinaryCommand cmd;
+        memcpy(&cmd, conn->read_buf + conn->consumed, sizeof(cmd));
+        conn->consumed += sizeof(BinaryCommand);
+
+        if (!validateCommand(cmd)) {
+            auto& rsp = buf.emplace_back();
+            rsp.type = RSP_ERROR;
+            rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_COMMAND_TYPE);
+        } else {
+            processRequest(cmd, buf);
         }
+    }
 
-        // 处理所有完整命令，响应追加到 buf
-        while (conn->pending - conn->consumed >= sizeof(BinaryCommand)) {
-            BinaryCommand cmd;
-            memcpy(&cmd, conn->read_buf + conn->consumed, sizeof(cmd));
-            conn->consumed += sizeof(BinaryCommand);
+    conn->compact();
 
-            if (!validateCommand(cmd)) {
-                auto& rsp = buf.emplace_back();
-                rsp.type = RSP_ERROR;
-                rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_COMMAND_TYPE);
-            } else {
-                processRequest(cmd, buf);
-            }
-            more = true;
-        }
-
-        conn->compact();
-    } while (more);
-
-    // 一次性推送所有积累的响应
     if (!buf.empty())
         pushResponses(conn->fd, buf);
 }
@@ -214,7 +178,7 @@ void TcpServer::closeConnection(ConnContext* conn)
     notifySendThread();
 
     // 再清理 IO 线程资源
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    poller_.free_buffer(conn->buf_idx);
     conns_.erase(fd);
     delete conn;
 }
