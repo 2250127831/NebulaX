@@ -38,6 +38,8 @@ NebulaX/
 ├── include/                   # 头文件
 │   ├── order.h                    订单定义
 │   ├── order_book.h               买卖盘 + 索引
+│   ├── order_pool.h               订单内存池（Phase 6）
+│   ├── order_map.h                订单 O(1) 查找索引
 │   ├── matching_engine.h          撮合引擎
 │   ├── protocol.h                 二进制协议（32B 命令 / 48B 响应）
 │   ├── spsc_byte_ring.h           SPSC 字节环形缓冲区（SEND_ZC 固定缓冲区）
