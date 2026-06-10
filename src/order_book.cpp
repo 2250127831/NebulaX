@@ -124,18 +124,20 @@ TopOfBook OrderBook::getTopOfBook() const
     if (!bids_.empty()) {
         const PriceLevel& level = bids_.begin()->second;
         tob.bid_price = bids_.begin()->first;
-        if (level.count > 0) {
-            const Order* o = pool_.at(level.head_idx);
-            tob.bid_volume = o->remaining_qty;
+        uint32_t idx = level.head_idx;
+        while (idx != UINT32_MAX) {
+            tob.bid_volume += pool_.at(idx)->remaining_qty;
+            idx = pool_.at(idx)->next_idx;
         }
     }
 
     if (!asks_.empty()) {
         const PriceLevel& level = asks_.begin()->second;
         tob.ask_price = asks_.begin()->first;
-        if (level.count > 0) {
-            const Order* o = pool_.at(level.head_idx);
-            tob.ask_volume = o->remaining_qty;
+        uint32_t idx = level.head_idx;
+        while (idx != UINT32_MAX) {
+            tob.ask_volume += pool_.at(idx)->remaining_qty;
+            idx = pool_.at(idx)->next_idx;
         }
     }
 
