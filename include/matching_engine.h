@@ -32,6 +32,13 @@ public:
         BinaryResponse& out_response
     ) const;
 
+    // 停机快照：将所有 resting orders 写入文件
+    void saveSnapshot(const char* path) const;
+
+    // 加载快照：从文件恢复订单簿
+    // 必须在处理任何命令之前调用
+    void loadSnapshot(const char* path);
+
 private:
     // 买单撮合逻辑
     // 往 out 追加 TRADE 记录

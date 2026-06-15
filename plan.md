@@ -1,0 +1,52 @@
+# NebulaX 工程化推进计划
+
+## 已完成
+
+- [x] 优雅关闭（SIGTERM handler + drain + io_shutdown_done 标志）
+- [x] Ring 背压（空间不足时自动降级 direct send）
+- [x] 停机快照（优雅退出时保存订单簿，重启后恢复）
+
+## 待完成
+
+### 3. CQE 错误差异化（~0.5天）
+
+io_uring CQE 返回的负值未做区分，EAGAIN 瞬态会误断连。
+区分 EAGAIN（重试）、ECONNRESET/EPIPE（正常断连）、其他（日志+断连）。
+
+### 4. WAL 最小可用版（~3天）
+
+IO 线程 crash 时优雅关闭的快照跑不了，需要 WAL 兜底。
+- mmap 日志文件，每条操作 append（NEW/CANCEL）
+- 文件满时全量 checkpoint
+- 启动时回放重建订单簿
+
+### 5. 线程存活检测（~2天）
+
+- 线程心跳计数器（per-thread relax store）
+- Watchdog（主线程轮询，超时 3s 触发紧急 dump + SIGTERM）
+- Send 线程无响应由进程内部重启
+- IO 线程无响应则转储退出，由外部 supervisor 拉起
+
+### 6. 监控指标（~2天）
+
+- Per-thread 非原子计数器（独立 cache line）
+- 共享内存 mmap 暴露 QPS/延迟/资源利用率
+- 外部采集器读取
+- OrderPool 使用率 >95% 告警（addOrder 在 100% 时自动返回 POOL_FULL）
+
+### 7. 结构化日志（~2天）
+
+- 独立 SPSC 环形缓冲区 + 日志线程消费
+- 日志级别（FATAL/ERROR/WARN/INFO/DEBUG）
+- 热路径不执行 IO 或格式化
+
+### 8. 连接管理（~1天）
+
+- 死连接检测
+- 连接关闭竞态修复（closing 标志 + 延迟清理）
+
+### 9. 测试补充（持续）
+
+- 单元测试（组件边界条件）
+- 状态一致性校验（quantity 守恒）
+- 压测程序模拟异常路径（ring 降级验证）

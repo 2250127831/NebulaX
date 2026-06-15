@@ -2,6 +2,7 @@
 
 #include <liburing.h>
 #include <sys/socket.h>
+#include <ctime>
 #include <netinet/in.h>
 #include <functional>
 #include <cstdint>
@@ -92,6 +93,19 @@ public:
 
     int submit_and_wait()
     {
+        return io_uring_submit_and_wait(&ring_, 1);
+    }
+
+    // 带超时的 submit_and_wait（用于优雅关闭时不被永久阻塞）
+    // timeout_ms 后即使无 CQE 也会返回
+    int submit_and_wait_timeout(uint64_t timeout_ms)
+    {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) return submit_and_wait();
+        struct timespec ts;
+        ts.tv_sec  = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+        io_uring_prep_timeout(sqe, (struct __kernel_timespec*)&ts, 1, 0);
         return io_uring_submit_and_wait(&ring_, 1);
     }
 

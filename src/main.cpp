@@ -4,6 +4,8 @@
 
 #include <csignal>
 #include <thread>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "send_uring.h"
+#include "shutdown_guard.h"
 
 int main(int argc, char* argv[])
 {
@@ -30,13 +33,16 @@ int main(int argc, char* argv[])
     }
 
     signal(SIGPIPE, SIG_IGN);
+    ShutdownGuard::install();
 
     MatchingEngine engine;
+    engine.loadSnapshot("/tmp/nebulaX_snapshot.dat");
     SPSCByteRing<RING_SIZE> ring;
 
     // ── 初始化 io_uring（可选，仅用于 SEND_ZC）──
     struct io_uring send_uring{};
     bool zc_ok = init_send_uring(send_uring, ring);
+    std::atomic<bool> io_shutdown_done{false};
 
     int wake_fd = eventfd(0, 0);
     if (wake_fd < 0) {
@@ -65,9 +71,10 @@ int main(int argc, char* argv[])
             pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
         }
 
-        while (true) {
+        while (!io_shutdown_done) {
             uint8_t hdr[48];
             if (ring.pop(hdr, 48) == 0) {
+                if (io_shutdown_done) break;
                 uint64_t val;
                 read(wake_fd, &val, 8);
                 continue;
@@ -116,9 +123,21 @@ int main(int argc, char* argv[])
         }
     });
 
+    // 等待 IO 线程退出（start() 内部已排空 ring）
     io_thread.join();
+    io_shutdown_done = true;
+    // 唤醒 Send 线程，它会看到 io_shutdown_done 后退出
+    {
+        uint64_t val = 1;
+        write(wake_fd, &val, sizeof(val));
+    }
     send_thread.join();
 
+    write(STDOUT_FILENO, "saving snapshot...\n", 19);
+    engine.saveSnapshot("/tmp/nebulaX_snapshot.dat");
+    write(STDOUT_FILENO, "snapshot done\n", 14);
+
     if (zc_ok) io_uring_queue_exit(&send_uring);
+    close(wake_fd);
     return 0;
 }

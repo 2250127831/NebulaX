@@ -58,6 +58,14 @@ public:
     // 根据 order_id 查订单
     Order* findOrder(uint64_t order_id);
 
+    // 停机快照：将所有 resting orders 写入文件（路径固定为 /tmp/nebulaX_snapshot.dat）
+    // 返回 max_order_id（恢复后应从此 +1 继续分配）
+    uint64_t saveSnapshot(const char* path) const;
+
+    // 加载快照：从文件恢复订单簿（返回 max_order_id）
+    // max_seq_out 和 max_id_out 用加载后应分配的起始值
+    void loadSnapshot(const char* path, uint64_t& max_seq_out, uint64_t& max_id_out);
+
     // 获取前 N 档盘口
     std::string getBookString(int levels) const;
 

@@ -82,6 +82,20 @@ void MatchingEngine::processCancel(
     }
 }
 
+void MatchingEngine::saveSnapshot(const char* path) const
+{
+    order_book_.saveSnapshot(path);
+}
+
+void MatchingEngine::loadSnapshot(const char* path)
+{
+    uint64_t max_seq = 0, max_id = 0;
+    order_book_.loadSnapshot(path, max_seq, max_id);
+    if (max_seq > 0) next_sequence_ = max_seq + 1;
+    if (max_id  > 0) next_order_id_ = max_id + 1;
+    printf("loadSnapshot: seq=%lu id=%lu\n", next_sequence_, next_order_id_);
+}
+
 void MatchingEngine::getBook(BinaryResponse& out) const
 {
     out.type = RSP_BOOK;

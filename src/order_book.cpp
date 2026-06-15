@@ -1,5 +1,8 @@
 #include "order_book.h"
 #include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdio>
 
 bool OrderBook::addOrder(const Order& order)
 {
@@ -226,4 +229,65 @@ std::string OrderBook::getBookString(int levels) const
 
     oss << "==============BOOK_END==============\n";
     return oss.str();
+}
+
+uint64_t OrderBook::saveSnapshot(const char* path) const
+{
+    uint64_t max_seq = 0, max_id = 0;
+    int fd = open(path, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+    if (fd < 0) return 0;
+
+    uint32_t magic = 0x4E4253;
+    write(fd, &magic, sizeof(magic));
+
+    for (auto& [price, level] : bids_) {
+        uint32_t idx = level.head_idx;
+        while (idx != UINT32_MAX) {
+            const Order* o = pool_.at(idx);
+            if (o->sequence > max_seq) max_seq = o->sequence;
+            if (o->order_id  > max_id) max_id  = o->order_id;
+            write(fd, o, sizeof(Order));
+            idx = o->next_idx;
+        }
+    }
+    for (auto& [price, level] : asks_) {
+        uint32_t idx = level.head_idx;
+        while (idx != UINT32_MAX) {
+            const Order* o = pool_.at(idx);
+            if (o->sequence > max_seq) max_seq = o->sequence;
+            if (o->order_id  > max_id) max_id  = o->order_id;
+            write(fd, o, sizeof(Order));
+            idx = o->next_idx;
+        }
+    }
+    close(fd);
+    return max_id;
+}
+
+void OrderBook::loadSnapshot(const char* path, uint64_t& max_seq_out, uint64_t& max_id_out)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+
+    uint32_t magic = 0;
+    read(fd, &magic, sizeof(magic));
+    if (magic != 0x4E4253) { close(fd); return; }
+
+    uint32_t loaded = 0;
+    while (true) {
+        Order o;
+        if (read(fd, &o, sizeof(Order)) != sizeof(Order)) break;
+        o.prev_idx = UINT32_MAX;
+        o.next_idx = UINT32_MAX;
+        o.pool_next_free = UINT32_MAX;
+        if (o.sequence > max_seq_out) max_seq_out = o.sequence;
+        if (o.order_id  > max_id_out) max_id_out  = o.order_id;
+        if (!addOrder(o))
+            write(STDERR_FILENO, "loadSnapshot: addOrder failed\n", 30);
+        loaded++;
+    }
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "loadSnapshot: %u orders\n", loaded);
+    write(STDERR_FILENO, buf, n);
+    close(fd);
 }

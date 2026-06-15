@@ -1,4 +1,5 @@
 #include "tcp_server.h"
+#include "shutdown_guard.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -81,8 +82,8 @@ void TcpServer::start()
     // 初始提交 accept SQE
     poller_.submit_accept(server_fd_);
 
-    while (true) {
-        int ret = poller_.submit_and_wait();
+    while (!ShutdownGuard::isStopping()) {
+        int ret = poller_.submit_and_wait_timeout(500);
         if (ret < 0) {
             if (errno == EINTR) continue;
             write(STDERR_FILENO, "ERROR: io_uring_submit_and_wait() failed\n", 42);
@@ -110,6 +111,33 @@ void TcpServer::start()
                     poller_.submit_recv(fd, it2->second->buf_idx);
             }
         );
+    }
+
+    // ── 优雅关闭 ──
+    close(server_fd_);
+    server_fd_ = -1;
+
+    for (auto& [fd, conn] : conns_) {
+        if (conn->pending > conn->consumed)
+            onRecv(conn, static_cast<int>(conn->pending - conn->consumed));
+
+        BinaryResponse frame;
+        frame.type = RSP_CLOSE;
+        frame.data.header.client_fd = fd;
+        frame.data.header.count = 0;
+        size_t retries = 0;
+        while (ring_.push(&frame, sizeof(BinaryResponse)) == 0) {
+            notifySendThread();
+            if (++retries > 10000) break;
+            __builtin_ia32_pause();
+        }
+        notifySendThread();
+    }
+
+    // 等 ring 排空（Send 线程会处理完 RSP_CLOSE 再退出）
+    while (ring_.free_space() < RING_SIZE) {
+        notifySendThread();
+        __builtin_ia32_pause();
     }
 }
 
@@ -212,31 +240,25 @@ void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
     }
 
     // 正常路径：推 RSP_HEADER + 响应帧到 ring，Send 线程消费
-    BinaryResponse header;
-    header.type = RSP_HEADER;
-    header.data.header.client_fd = fd;
-    header.data.header.count = count;
-
-    while (ring_.push(&header, sizeof(BinaryResponse)) == 0) {
+    // 若 ring 空间不足则 direct send（不阻塞 IO 线程）
+    if (ring_.free_space() >= sizeof(BinaryResponse) + bytes) {
+        BinaryResponse header;
+        header.type = RSP_HEADER;
+        header.data.header.client_fd = fd;
+        header.data.header.count = count;
+        ring_.push(&header, sizeof(BinaryResponse));
+        ring_.push(reinterpret_cast<const uint8_t*>(buf.data()), bytes);
         notifySendThread();
-        __builtin_ia32_pause();
-    }
-
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(buf.data());
-    size_t remaining = bytes;
-    size_t off = 0;
-    while (remaining > 0) {
-        size_t n = ring_.push(ptr + off, remaining);
-        if (n == 0) {
-            notifySendThread();
-            __builtin_ia32_pause();
-            continue;
+    } else {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
+        size_t sent = 0;
+        while (sent < bytes) {
+            ssize_t r = send(fd, data + sent, bytes - sent, MSG_NOSIGNAL);
+            if (r > 0) sent += r;
+            else if (r == -1 && errno == EAGAIN) __builtin_ia32_pause();
+            else break;
         }
-        off += n;
-        remaining -= n;
     }
-
-    notifySendThread();
 }
 
 void TcpServer::notifySendThread()

@@ -28,8 +28,8 @@ target_link_options(nebulaX PRIVATE
 find_package(Threads REQUIRED)
 target_link_libraries(nebulaX PRIVATE Threads::Threads)
 
-# io_uring（静态链接 /usr/local/liburing 2.4，避免系统旧版干扰）
+# io_uring（静态链接 $HOME/.local/lib/liburing.a 2.4，避免系统旧版干扰）
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBURING REQUIRED liburing)
 target_include_directories(nebulaX PRIVATE ${LIBURING_INCLUDE_DIRS})
-target_link_libraries(nebulaX PRIVATE /usr/local/lib/liburing.a)
+target_link_libraries(nebulaX PRIVATE $ENV{HOME}/.local/lib/liburing.a)
