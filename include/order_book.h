@@ -23,6 +23,7 @@ struct PriceLevel
     uint32_t head_idx = UINT32_MAX;
     uint32_t tail_idx = UINT32_MAX;
     uint32_t count = 0;
+    uint32_t total_qty = 0;
 };
 
 class OrderBook
@@ -46,6 +47,10 @@ public:
 
     // 获取最优卖价（最低 ask），可排除指定 user_id（自成交防护）
     Order* getBestAsk(uint64_t exclude_user_id = 0);
+
+    // 撮合时减少盘口订单余量，自动维护 PriceLevel 总余量
+    // trade_qty = std::min(remaining_qty, best_ask->remaining_qty)
+    void reduceOrderQty(Order* order, uint32_t amount);
 
     // 获取 top-of-book（best bid / best ask 的聚合量）
     TopOfBook getTopOfBook() const;

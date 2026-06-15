@@ -9,8 +9,6 @@
 #include "matching_engine.h"
 #include "protocol.h"
 
-constexpr size_t RING_SIZE = 1048576;  // 1 MB
-
 // 连接上下文：读缓冲（仅 IO+Matching 线程使用）
 struct ConnContext
 {

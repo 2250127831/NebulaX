@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "send_uring.h"
 
 int main(int argc, char* argv[])
 {
@@ -33,8 +34,9 @@ int main(int argc, char* argv[])
     MatchingEngine engine;
     SPSCByteRing<RING_SIZE> ring;
 
-    // 尝试初始化 io_uring SEND_ZC（失败不致命，后续降级到 plain send）
-    bool zc_ok = ring.init_uring();
+    // ── 初始化 io_uring（可选，仅用于 SEND_ZC）──
+    struct io_uring send_uring{};
+    bool zc_ok = init_send_uring(send_uring, ring);
 
     int wake_fd = eventfd(0, 0);
     if (wake_fd < 0) {
@@ -80,21 +82,20 @@ int main(int argc, char* argv[])
 
             int fd = rsp->data.header.client_fd;
             uint32_t count = rsp->data.header.count;
-
             size_t need = count * sizeof(BinaryResponse);
 
+            // ── SEND_ZC 路径 ──
             if (zc_ok && need >= 4096) {
-                // 大块数据走 SEND_ZC
-                ssize_t r = ring.send_zc_all(fd, need, MSG_NOSIGNAL);
+                ssize_t r = send_zc_all(ring, send_uring, fd, need, MSG_NOSIGNAL);
                 if (r == -EOPNOTSUPP || r == -ENOSYS)
-                    zc_ok = false;           // 内核不支持，降级到 plain send
+                    zc_ok = false;
                 else if (r < 0)
-                    continue;                // 连接断开，取下一条
+                    continue;
                 else
-                    continue;                // 发送完成
+                    continue;
             }
 
-            // plain send 路径
+            // ── plain send 路径 ──
             size_t sent = 0;
             while (sent < need) {
                 const void* ptr;
@@ -117,5 +118,7 @@ int main(int argc, char* argv[])
 
     io_thread.join();
     send_thread.join();
+
+    if (zc_ok) io_uring_queue_exit(&send_uring);
     return 0;
 }

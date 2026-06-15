@@ -20,6 +20,7 @@ public:
         : nodes_(new Node[capacity])
         , buckets_(new uint32_t[roundPow2(capacity)])
         , bucket_mask_(roundPow2(capacity) - 1)
+        , hash_shift_(64 - __builtin_ctz(bucket_mask_ + 1))
         , capacity_(capacity)
     {
         // 空闲链表
@@ -103,6 +104,7 @@ private:
     Node* const    nodes_;
     uint32_t* const buckets_;
     const uint32_t bucket_mask_;
+    const uint32_t hash_shift_;
     const size_t   capacity_;
     uint32_t       free_head_ = UINT32_MAX;
     size_t         size_ = 0;
@@ -117,7 +119,7 @@ private:
     uint32_t hash(uint64_t id) const
     {
         // 乘黄金常数取高位，对任何 ID 分布都均匀
-        return (id * 0x9E3779B97F4A7C15ULL) >> (64 - __builtin_ctz(bucket_mask_ + 1));
+        return (id * 0x9E3779B97F4A7C15ULL) >> hash_shift_;
     }
 
     uint32_t allocNode()

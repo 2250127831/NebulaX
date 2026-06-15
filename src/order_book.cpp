@@ -27,9 +27,20 @@ bool OrderBook::addOrder(const Order& order)
         level.tail_idx = idx;
     }
     level.count++;
+    level.total_qty += order.remaining_qty;
 
     order_index_.insert(order.order_id, new_order);
     return true;
+}
+
+void OrderBook::reduceOrderQty(Order* order, uint32_t amount)
+{
+    order->remaining_qty -= amount;
+    order->filled_qty += amount;
+
+    PriceLevel& level = (order->side == Side::BUY)
+        ? bids_[order->price] : asks_[order->price];
+    level.total_qty -= amount;
 }
 
 void OrderBook::removeOrder(Order* order)
@@ -56,6 +67,7 @@ void OrderBook::removeOrder(Order* order)
         lvl.tail_idx = order->prev_idx;
 
     lvl.count--;
+    lvl.total_qty -= order->remaining_qty;
     if (lvl.count == 0) {
         if (order->side == Side::BUY)
             bids_.erase(order->price);
@@ -124,19 +136,13 @@ TopOfBook OrderBook::getTopOfBook() const
     if (!bids_.empty()) {
         const PriceLevel& level = bids_.begin()->second;
         tob.bid_price = bids_.begin()->first;
-        if (level.count > 0) {
-            const Order* o = pool_.at(level.head_idx);
-            tob.bid_volume = o->remaining_qty;
-        }
+        tob.bid_volume = level.total_qty;
     }
 
     if (!asks_.empty()) {
         const PriceLevel& level = asks_.begin()->second;
         tob.ask_price = asks_.begin()->first;
-        if (level.count > 0) {
-            const Order* o = pool_.at(level.head_idx);
-            tob.ask_volume = o->remaining_qty;
-        }
+        tob.ask_volume = level.total_qty;
     }
 
     return tob;

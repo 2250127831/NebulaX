@@ -107,8 +107,7 @@ void MatchingEngine::matchBuyOrder(Order& order, std::vector<BinaryResponse>& ou
         order.remaining_qty -= trade_qty;
         order.filled_qty   += trade_qty;
 
-        best_ask->remaining_qty -= trade_qty;
-        best_ask->filled_qty   += trade_qty;
+        order_book_.reduceOrderQty(best_ask, trade_qty);
 
         // 记录成交
         {
@@ -153,8 +152,7 @@ void MatchingEngine::matchSellOrder(Order& order, std::vector<BinaryResponse>& o
         order.remaining_qty -= trade_qty;
         order.filled_qty   += trade_qty;
 
-        best_bid->remaining_qty -= trade_qty;
-        best_bid->filled_qty   += trade_qty;
+        order_book_.reduceOrderQty(best_bid, trade_qty);
 
         // 记录成交
         {
