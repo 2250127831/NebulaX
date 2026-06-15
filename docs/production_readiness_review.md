@@ -15,20 +15,21 @@
 5. [io_uring CQE 错误无差异化处理（P1）](#5-io_uring-cqe-错误无差异化处理p1)
 6. [连接管理：无空闲超时 + 关闭竞态（P1）](#6-连接管理无空闲超时--关闭竞态p1)
 7. [内存池全满后无降级策略（P1）](#7-内存池全满后无降级策略p1)
-8. [全无监控与度量（P1）](#8-全无监控与度量p1)
-9. [缺少结构化日志（P2）](#9-缺少结构化日志p2)
-10. [无持久化——重启即丢失全部状态（P2）](#10-无持久化重启即丢失全部状态p2)
-11. [单线程 IO + 撮合 = 阻塞点（P2）](#11-单线程-io--撮合--阻塞点p2)
-12. [SEND_ZC 路径数据丢失风险（P2）](#12-send_zc-路径数据丢失风险p2)
-13. [连接关闭存在竞态条件（P2）](#13-连接关闭存在竞态条件p2)
-14. [book 只返回 top-of-book，深度信息不足](#14-book-只返回-top-of-book深度信息不足)
-15. [测试覆盖缺口（P2）](#15-测试覆盖缺口p2)
-16. [二进制协议缺少保护措施](#16-二进制协议缺少保护措施)
-17. [无 DoS 防护与安全基线](#17-无-dos-防护与安全基线)
-18. [构建与部署（P3）](#18-构建与部署p3)
-19. [Gateway 架构下的修正优先级](#19-gateway-架构下的修正优先级)
-20. [总结：问题优先级总表](#20-总结问题优先级总表)
-21. [多线程架构扩展审查](#21-多线程架构扩展审查)
+8. [OrderMap 哈希桶退化风险（P2）](#8-ordermap-哈希桶退化风险p2)
+9. [全无监控与度量（P1）](#9-全无监控与度量p1)
+10. [缺少结构化日志（P2）](#9-缺少结构化日志p2)
+11. [无持久化——重启即丢失全部状态（P2）](#10-无持久化重启即丢失全部状态p2)
+12. [单线程 IO + 撮合 = 阻塞点（P2）](#11-单线程-io--撮合--阻塞点p2)
+13. [SEND_ZC 路径数据丢失风险（P2）](#12-send_zc-路径数据丢失风险p2)
+14. [连接关闭存在竞态条件（P2）](#13-连接关闭存在竞态条件p2)
+15. [book 只返回 top-of-book，深度信息不足](#14-book-只返回-top-of-book深度信息不足)
+16. [测试覆盖缺口（P2）](#15-测试覆盖缺口p2)
+17. [二进制协议缺少保护措施](#16-二进制协议缺少保护措施)
+18. [无 DoS 防护与安全基线](#17-无-dos-防护与安全基线)
+19. [构建与部署（P3）](#18-构建与部署p3)
+20. [Gateway 架构下的修正优先级](#19-gateway-架构下的修正优先级)
+21. [总结：问题优先级总表](#20-总结问题优先级总表)
+22. [多线程架构扩展审查](#21-多线程架构扩展审查)
 
 ---
 
@@ -695,7 +696,58 @@ explicit OrderBook(size_t pool_capacity /* 从配置读取，默认 4M */);
 
 ---
 
-## 8. 全无监控与度量（P1）
+## 8. OrderMap 哈希桶退化风险（P2）
+
+### 发现的问题
+
+OrderMap 使用分离链接法处理哈希冲突，桶内链表在大量 key 映射到同桶时退化到 O(n)：
+
+```cpp
+Order* find(uint64_t order_id) const {
+    uint32_t idx = buckets_[hash(order_id)];
+    while (idx != UINT32_MAX) {
+        if (nodes_[idx].order_id == order_id)
+            return nodes_[idx].order;
+        idx = nodes_[idx].next_idx;  // 链越长，查找越慢
+    }
+    return nullptr;
+}
+```
+
+正常情况下 order_id 递增 + 黄金常数哈希分布均匀，链长很少超过 2-3。但在恶意输入或极端业务场景下，单桶链可能累积到上千条，`find()` / `erase()` 性能从 O(1) 退化为 O(n)，拖慢整个撮合流程。
+
+### 改进方案
+
+借鉴 Java 8+ HashMap，单桶链超过阈值（8）后转为有序链表，find 可提前终止（key < target 时停止）：
+
+```cpp
+static constexpr uint32_t TREEIFY_THRESHOLD = 8;
+
+struct Bucket {
+    uint32_t head_idx = UINT32_MAX;
+    uint32_t chain_len = 0;       // 当前链长度
+};
+
+Order* find(uint64_t key) {
+    uint32_t b = hash(key) & bucket_mask_;
+    Bucket& bk = buckets_[b];
+    if (bk.head_idx == UINT32_MAX) return nullptr;
+
+    // 有序链：遇到 key < target 即可停止
+    uint32_t idx = bk.head_idx;
+    while (idx != UINT32_MAX && nodes_[idx].key < key)
+        idx = nodes_[idx].next_idx;
+    if (idx != UINT32_MAX && nodes_[idx].key == key)
+        return nodes_[idx].value;
+    return nullptr;
+}
+```
+
+insert 超阈值时将链表按键排序，之后 insert 维护有序。节点结构零改动（链指针复用），内存仅增加 Bucket 的 `chain_len` 字段。
+
+---
+
+## 9. 全无监控与度量（P1）
 
 ### 发现的问题
 
@@ -797,7 +849,7 @@ void* addr = mmap(nullptr, ..., MAP_SHARED, shm_fd, 0);
 
 ---
 
-## 9. 缺少结构化日志（P2）
+## 10. 缺少结构化日志（P2）
 
 ### 发现的问题
 
@@ -868,7 +920,7 @@ void logWrite(LogLevel level, const char* file, int line,
 
 ---
 
-## 10. 无持久化——重启即丢失全部状态（P2）
+## 11. 无持久化——重启即丢失全部状态（P2）
 
 ### 发现的问题
 
@@ -943,7 +995,7 @@ public:
 
 ---
 
-## 11. 单线程 IO + 撮合 = 阻塞点（P2）
+## 12. 单线程 IO + 撮合 = 阻塞点（P2）
 
 ### 发现的问题
 
@@ -1008,7 +1060,7 @@ Client → Gateway
 
 ---
 
-## 12. SEND_ZC 路径数据丢失风险（P2）
+## 13. SEND_ZC 路径数据丢失风险（P2）
 
 ### 发现的问题
 
@@ -1052,7 +1104,7 @@ if (zc_ok && need >= 4096) {
 
 ---
 
-## 13. 连接关闭存在竞态条件（P2）
+## 14. 连接关闭存在竞态条件（P2）
 
 ### 发现的问题
 
@@ -1119,7 +1171,7 @@ void TcpServer::onAccept(int client_fd) {
 
 ---
 
-## 14. book 只返回 top-of-book，深度信息不足
+## 15. book 只返回 top-of-book，深度信息不足
 
 ### 发现的问题
 
@@ -1154,7 +1206,7 @@ TopOfBook OrderBook::getTopOfBook() const {
 
 ---
 
-## 15. 测试覆盖缺口（P2）
+## 16. 测试覆盖缺口（P2）
 
 ### 发现的问题
 
@@ -1220,7 +1272,7 @@ void test_self_trade_prevention() {
 
 ---
 
-## 16. 二进制协议缺少保护措施
+## 17. 二进制协议缺少保护措施
 
 ### 发现的问题
 
@@ -1266,7 +1318,7 @@ conn->last_client_seq = cmd.client_seq;
 
 ---
 
-## 17. 无 DoS 防护与安全基线
+## 18. 无 DoS 防护与安全基线
 
 ### 说明
 
@@ -1289,7 +1341,7 @@ Gateway 在前端负责安全接入，因此以下场景由 Gateway 覆盖，Neb
 
 ---
 
-## 18. 构建与部署（P3）
+## 19. 构建与部署（P3）
 
 ### 发现的问题
 
@@ -1329,7 +1381,7 @@ target_compile_options(nebulaX PRIVATE
 
 ---
 
-## 19. Gateway 架构下的修正优先级
+## 20. Gateway 架构下的修正优先级
 
 ### 架构回顾
 
@@ -1365,7 +1417,7 @@ Client → [互联网] → Gateway → [内网] → NebulaX
 
 ---
 
-## 20. 总结：问题优先级总表
+## 21. 总结：问题优先级总表
 
 ### P0 —— 上生产前必须解决
 
@@ -1406,7 +1458,7 @@ Client → [互联网] → Gateway → [内网] → NebulaX
 
 ---
 
-## 21. 多线程架构扩展审查
+## 22. 多线程架构扩展审查
 
 ### 新增架构
 
