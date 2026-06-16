@@ -7,6 +7,12 @@
 #include <functional>
 #include <cstdint>
 
+// IORING_RECVSEND_POLL_FIRST: 让 io_uring recv 先 poll 而非立即回 -EAGAIN
+// 内核 5.19+，系统头文件可能未导出，手动保证
+#ifndef IORING_RECVSEND_POLL_FIRST
+#define IORING_RECVSEND_POLL_FIRST (1U << 0)
+#endif
+
 // io_uring 事件轮询器，替代 epoll_wait + recv 循环。
 // 只负责 recv 路径——send 路径（SPSC ring + eventfd）完全不碰。
 class IoUringPoller
@@ -67,13 +73,14 @@ public:
 
     // ── SQE 提交 ──
 
-    // 使用固定缓冲区的 recv
+    // recv（带 POLL_FIRST）：无数据时内核 poll 等待，不立即回 -EAGAIN
     bool submit_recv(int fd, uint32_t buf_idx)
     {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) return false;
         io_uring_prep_recv(sqe, fd, bufs_[buf_idx], BUF_SIZE, 0);
         sqe->buf_index = buf_idx;
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(fd)));
         return true;
     }

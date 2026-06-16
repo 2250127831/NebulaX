@@ -3,6 +3,7 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstdint>
@@ -69,6 +70,14 @@ TcpServer::~TcpServer()
         delete conn;
     }
     conns_.clear();
+
+    // 清理 pending close 残留（正常情况下 start() 已排空）
+    for (auto* conn : pending_closes_) {
+        conns_.erase(conn->fd);
+        close(conn->fd);
+        delete conn;
+    }
+
     if (server_fd_ >= 0) close(server_fd_);
 }
 
@@ -97,34 +106,61 @@ void TcpServer::start()
                 // 重新提交 accept SQE 以接收下一个连接
                 poller_.submit_accept(server_fd_);
             },
-            // on_recv: 客户端数据到达
+            // on_recv: 客户端数据到达或 CQE 错误
             [this](int fd, int bytes_read) {
                 auto it = conns_.find(fd);
                 if (it == conns_.end()) return;
                 auto* conn = it->second;
 
+                if (conn->closing) return;  // 已在关闭中，忽略后续 CQE
+
+                if (bytes_read == -EAGAIN) {
+                    // transient: 无数据就绪，重新提交 recv
+                    poller_.submit_recv(fd, conn->buf_idx);
+                    return;
+                }
+
+                if (bytes_read < 0) {
+                    if (bytes_read != -ECONNRESET && bytes_read != -EPIPE) {
+                        write(STDERR_FILENO, "unexpected recv error\n", 22);
+                    }
+                }
+
                 onRecv(conn, bytes_read);
 
-                // onRecv 可能已关闭连接，需再次查找
+                // onRecv 可能关闭了连接；若仍存活，重新提交 recv
                 auto it2 = conns_.find(fd);
-                if (it2 != conns_.end())
+                if (it2 != conns_.end() && !it2->second->closing)
                     poller_.submit_recv(fd, it2->second->buf_idx);
             }
         );
+
+        drainPendingClose();
     }
 
     // ── 优雅关闭 ──
     close(server_fd_);
     server_fd_ = -1;
 
+    // 第一遍：刷完所有连接上残余的未处理数据
     for (auto& [fd, conn] : conns_) {
         if (conn->pending > conn->consumed)
             onRecv(conn, static_cast<int>(conn->pending - conn->consumed));
+    }
+
+    // 第二遍：未关闭的推 RSP_CLOSE，已在 pending 中的跳过
+    for (auto& [fd, conn] : conns_) {
+        if (conn->closing) continue;
+
+        conn->closing = true;
+        conn->close_acked = false;
 
         BinaryResponse frame;
         frame.type = RSP_CLOSE;
         frame.data.header.client_fd = fd;
         frame.data.header.count = 0;
+        frame.data.header.ack_ptr = &conn->close_acked;
+
         size_t retries = 0;
         while (ring_.push(&frame, sizeof(BinaryResponse)) == 0) {
             notifySendThread();
@@ -132,13 +168,18 @@ void TcpServer::start()
             __builtin_ia32_pause();
         }
         notifySendThread();
+
+        pending_closes_.push_back(conn);
     }
 
-    // 等 ring 排空（Send 线程会处理完 RSP_CLOSE 再退出）
+    // 等 ring 排空（Send 线程处理 RSP_CLOSE → close(fd) → 写 ack）
     while (ring_.free_space() < RING_SIZE) {
         notifySendThread();
         __builtin_ia32_pause();
     }
+
+    // 所有关闭已确认，清理 pending 链表
+    drainPendingClose();
 }
 
 void TcpServer::onAccept(int client_fd)
@@ -148,6 +189,16 @@ void TcpServer::onAccept(int client_fd)
         close(client_fd);
         return;
     }
+
+    // TCP keepalive：检测死连接（网络中断/对端崩溃），活着的空闲连接不受影响
+    int keepalive = 1;
+    int keepidle  = 10;   // 10s 无数据 → 开始探测
+    int keepintvl = 5;    // 探测间隔 5s
+    int keepcnt   = 3;    // 连续 3 次无响应 → 断连
+    setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
     auto* conn = new ConnContext{};
     conn->fd = client_fd;
@@ -193,22 +244,42 @@ void TcpServer::onRecv(ConnContext* conn, int bytes_read)
 void TcpServer::closeConnection(ConnContext* conn)
 {
     int fd = conn->fd;
+    conn->closing = true;
+    conn->close_acked = false;
 
-    // 先通知 Send 线程关闭 fd（确保所有排队的响应已发完再关）
+    // 推 RSP_CLOSE（带 ack 指针），Send 线程 close(fd) 后写回确认
     BinaryResponse frame;
     frame.type = RSP_CLOSE;
     frame.data.header.client_fd = fd;
     frame.data.header.count = 0;
+    frame.data.header.ack_ptr = &conn->close_acked;
+
+    size_t retries = 0;
     while (ring_.push(&frame, sizeof(BinaryResponse)) == 0) {
         notifySendThread();
+        if (++retries > 10000) break;
         __builtin_ia32_pause();
     }
     notifySendThread();
 
-    // 再清理 IO 线程资源
-    poller_.free_buffer(conn->buf_idx);
-    conns_.erase(fd);
-    delete conn;
+    // 移入 pending close 列表，等 Send 确认后再回收
+    pending_closes_.push_back(conn);
+}
+
+void TcpServer::drainPendingClose()
+{
+    auto it = pending_closes_.begin();
+    while (it != pending_closes_.end()) {
+        auto* conn = *it;
+        if (conn->close_acked.load(std::memory_order_acquire)) {
+            poller_.free_buffer(conn->buf_idx);
+            conns_.erase(conn->fd);
+            delete conn;
+            it = pending_closes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)

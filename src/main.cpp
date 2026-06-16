@@ -83,6 +83,7 @@ int main(int argc, char* argv[])
             auto* rsp = reinterpret_cast<BinaryResponse*>(hdr);
             if (rsp->type == RSP_CLOSE) {
                 close(rsp->data.header.client_fd);
+                rsp->data.header.ack_ptr->store(true, std::memory_order_release);
                 continue;
             }
             if (rsp->type != RSP_HEADER) continue;

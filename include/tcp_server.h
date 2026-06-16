@@ -2,7 +2,9 @@
 
 #include <cstring>
 #include <vector>
+#include <list>
 #include <unordered_map>
+#include <atomic>
 
 #include "spsc_byte_ring.h"
 #include "io_uring_poller.h"
@@ -17,6 +19,9 @@ struct ConnContext
     uint32_t buf_idx = UINT32_MAX;  // 固定缓冲区索引，用于 re-arm recv
     size_t pending = 0;
     size_t consumed = 0;
+
+    bool closing = false;                      // 正在关闭，不再提交 recv
+    std::atomic<bool> close_acked{false};      // Send 线程 close(fd) 后置 true
 
     void compact()
     {
@@ -51,6 +56,7 @@ private:
     void onRecv(ConnContext* conn, int bytes_read);
 
     void closeConnection(ConnContext* conn);
+    void drainPendingClose();
     void pushResponses(int fd, const std::vector<BinaryResponse>& buf);
     void notifySendThread();
 
@@ -68,4 +74,5 @@ private:
 
     IoUringPoller poller_;
     std::unordered_map<int, ConnContext*> conns_;
+    std::list<ConnContext*> pending_closes_;  // 等待 Send 确认的关闭连接（尾插，老的在队首）
 };

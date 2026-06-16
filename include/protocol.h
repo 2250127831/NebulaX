@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 
 // ── Binary command type constants ──
 constexpr uint8_t CMD_NEW    = 0x01;
@@ -94,10 +95,12 @@ struct BinaryResponse
         } error;
 
         // type == RSP_HEADER (线程间通信：fd + 后续响应帧数)
+        // type == RSP_CLOSE 时 ack_ptr 指向关闭确认原子变量
         struct
         {
             int      client_fd;
             uint32_t count;
+            std::atomic<bool>* ack_ptr;       // RSP_CLOSE: Send 线程 close(fd) 后置 true
         } header;
 
         // type == RSP_BOOK
