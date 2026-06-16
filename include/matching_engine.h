@@ -4,11 +4,16 @@
 
 #include "order_book.h"
 #include "protocol.h"
+#include "metrics.h"
 
 class MatchingEngine
 {
 public:
-    MatchingEngine() = default;
+    explicit MatchingEngine(IOCounters* metrics = nullptr)
+        : metrics_(metrics)
+    {
+        if (metrics_) metrics_->order_pool_capacity = order_book_.poolCapacity();
+    }
 
     // 处理新订单
     // 往 out_responses 追加 TRADE + 最终状态
@@ -61,4 +66,6 @@ private:
 
     // 全局顺序号，用于时间优先（FIFO）
     uint64_t next_sequence_ = 1;
+
+    mutable IOCounters* metrics_ = nullptr;
 };

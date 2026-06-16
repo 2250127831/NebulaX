@@ -7,13 +7,7 @@
 - [x] 停机快照（优雅退出时保存订单簿，重启后恢复）
 - [x] CQE 错误差异化（EAGAIN 重试、ECONNRESET/EPIPE 正常断连、其他日志）
 - [x] 连接管理（TCP keepalive 死连检测 + ack 关闭竞态修复）
-
-### 2. 监控指标（~2天）
-
-- Per-thread 非原子计数器（独立 cache line）
-- 共享内存 mmap 暴露 QPS/延迟/资源利用率
-- 外部采集器读取
-- OrderPool 使用率 >95% 告警（addOrder 在 100% 时自动返回 POOL_FULL）
+- [x] 监控指标（Per-thread 计数器 + shm_open 共享内存 + read_metrics.py 采集脚本）
 
 ### 3. 结构化日志（~2天）
 

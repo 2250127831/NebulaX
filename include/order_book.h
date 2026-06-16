@@ -58,6 +58,10 @@ public:
     // 根据 order_id 查订单
     Order* findOrder(uint64_t order_id);
 
+    // 返回 OrderPool 已用量（监控用）
+    size_t poolUsage() const { return pool_.size(); }
+    size_t poolCapacity() const { return pool_.capacity(); }
+
     // 停机快照：将所有 resting orders 写入文件（路径固定为 /tmp/nebulaX_snapshot.dat）
     // 返回 max_order_id（恢复后应从此 +1 继续分配）
     uint64_t saveSnapshot(const char* path) const;

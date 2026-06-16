@@ -10,8 +10,9 @@
 
 TcpServer::TcpServer(int port, MatchingEngine& engine,
                      SPSCByteRing<RING_SIZE>& resp_ring,
-                     int wake_fd)
-    : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd)
+                     int wake_fd,
+                     IOCounters* metrics)
+    : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd), metrics_(metrics)
 {
     // ── create server socket (non-blocking) ──
     server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -114,6 +115,8 @@ void TcpServer::start()
 
                 if (conn->closing) return;  // 已在关闭中，忽略后续 CQE
 
+                if (metrics_) metrics_->recv_frames++;
+
                 if (bytes_read == -EAGAIN) {
                     // transient: 无数据就绪，重新提交 recv
                     poller_.submit_recv(fd, conn->buf_idx);
@@ -123,6 +126,7 @@ void TcpServer::start()
                 if (bytes_read < 0) {
                     if (bytes_read != -ECONNRESET && bytes_read != -EPIPE) {
                         write(STDERR_FILENO, "unexpected recv error\n", 22);
+                        if (metrics_) metrics_->errors++;
                     }
                 }
 

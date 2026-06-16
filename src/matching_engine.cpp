@@ -9,11 +9,14 @@ void MatchingEngine::processNewOrder(
     uint64_t user_id,
     std::vector<BinaryResponse>& out)
 {
+    if (metrics_) metrics_->new_orders++;
+
     if (side == Side::INVALID)
     {
         auto& rsp = out.emplace_back();
         rsp.type = RSP_ERROR;
         rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_SIDE);
+        if (metrics_) metrics_->errors++;
         return;
     }
 
@@ -22,6 +25,7 @@ void MatchingEngine::processNewOrder(
         auto& rsp = out.emplace_back();
         rsp.type = RSP_ERROR;
         rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_PRICE_QTY_USER);
+        if (metrics_) metrics_->errors++;
         return;
     }
 
@@ -48,10 +52,12 @@ void MatchingEngine::processNewOrder(
             auto& rsp = out.emplace_back();
             rsp.type = RSP_ERROR;
             rsp.data.error.code = static_cast<uint16_t>(ErrorCode::POOL_FULL);
+            if (metrics_) { metrics_->errors++; metrics_->order_pool_used = order_book_.poolUsage(); }
         } else {
             auto& rsp = out.emplace_back();
             rsp.type = RSP_OK;
             rsp.data.ack.order_id = order.order_id;
+            if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
         }
     }
     else if (order.status == OrderStatus::FILLED)
@@ -67,6 +73,7 @@ void MatchingEngine::processCancel(
     uint64_t user_id,
     std::vector<BinaryResponse>& out)
 {
+    if (metrics_) metrics_->cancels++;
     bool removed = order_book_.removeOrder(order_id, user_id);
 
     auto& rsp = out.emplace_back();
@@ -79,6 +86,7 @@ void MatchingEngine::processCancel(
     {
         rsp.type = RSP_ERROR;
         rsp.data.error.code = static_cast<uint16_t>(ErrorCode::ORDER_NOT_FOUND);
+        if (metrics_) metrics_->errors++;
     }
 }
 
@@ -94,10 +102,12 @@ void MatchingEngine::loadSnapshot(const char* path)
     if (max_seq > 0) next_sequence_ = max_seq + 1;
     if (max_id  > 0) next_order_id_ = max_id + 1;
     printf("loadSnapshot: seq=%lu id=%lu\n", next_sequence_, next_order_id_);
+    if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
 }
 
 void MatchingEngine::getBook(BinaryResponse& out) const
 {
+    if (metrics_) metrics_->book_queries++;
     out.type = RSP_BOOK;
 
     TopOfBook tob = order_book_.getTopOfBook();
@@ -133,6 +143,7 @@ void MatchingEngine::matchBuyOrder(Order& order, std::vector<BinaryResponse>& ou
             rsp.data.trade.seller_id     = best_ask->user_id;
             rsp.data.trade.buy_order_id  = order.order_id;
             rsp.data.trade.sell_order_id = best_ask->order_id;
+            if (metrics_) metrics_->trades++;
         }
 
         if (best_ask->remaining_qty == 0)
@@ -178,6 +189,7 @@ void MatchingEngine::matchSellOrder(Order& order, std::vector<BinaryResponse>& o
             rsp.data.trade.seller_id     = order.user_id;
             rsp.data.trade.buy_order_id  = best_bid->order_id;
             rsp.data.trade.sell_order_id = order.order_id;
+            if (metrics_) metrics_->trades++;
         }
 
         if (best_bid->remaining_qty == 0)

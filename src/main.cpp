@@ -12,10 +12,14 @@
 
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include "send_uring.h"
 #include "shutdown_guard.h"
+#include "metrics.h"
 
 int main(int argc, char* argv[])
 {
@@ -35,7 +39,17 @@ int main(int argc, char* argv[])
     signal(SIGPIPE, SIG_IGN);
     ShutdownGuard::install();
 
-    MatchingEngine engine;
+    // ── 共享内存 —— 暴露性能计数器 ──
+    const char* shm_path = "/nebulaX_metrics";
+    int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0644);
+    if (shm_fd < 0) { write(STDERR_FILENO, "ERROR: shm_open failed\n", 23); return 1; }
+    ftruncate(shm_fd, sizeof(SharedMetrics));
+    auto* shared = static_cast<SharedMetrics*>(mmap(nullptr, sizeof(SharedMetrics),
+        PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
+    close(shm_fd);
+    if (shared == MAP_FAILED) { write(STDERR_FILENO, "ERROR: mmap failed\n", 19); return 1; }
+
+    MatchingEngine engine(shared ? &shared->io : nullptr);
     engine.loadSnapshot("/tmp/nebulaX_snapshot.dat");
     SPSCByteRing<RING_SIZE> ring;
 
@@ -58,18 +72,23 @@ int main(int argc, char* argv[])
             CPU_SET(io_core, &cs);
             pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
         }
-        TcpServer server(port, engine, ring, wake_fd);
+        if (shared) shared->io_thread_pid = static_cast<uint64_t>(syscall(SYS_gettid));
+        TcpServer server(port, engine, ring, wake_fd, shared ? &shared->io : nullptr);
         server.start();
     });
 
     // ── Send 线程 ──
-    std::thread send_thread([&]() {
+    auto* send_metrics = shared ? &shared->send : nullptr;
+
+    std::thread send_thread([&, send_metrics, shared]() {
         if (send_core >= 0) {
             cpu_set_t cs;
             CPU_ZERO(&cs);
             CPU_SET(send_core, &cs);
             pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
         }
+
+        if (shared) shared->send_thread_pid = static_cast<uint64_t>(syscall(SYS_gettid));
 
         while (!io_shutdown_done) {
             uint8_t hdr[48];
@@ -92,15 +111,20 @@ int main(int argc, char* argv[])
             uint32_t count = rsp->data.header.count;
             size_t need = count * sizeof(BinaryResponse);
 
+            if (send_metrics) send_metrics->send_batches++;
+
             // ── SEND_ZC 路径 ──
             if (zc_ok && need >= 4096) {
                 ssize_t r = send_zc_all(ring, send_uring, fd, need, MSG_NOSIGNAL);
                 if (r == -EOPNOTSUPP || r == -ENOSYS)
                     zc_ok = false;
-                else if (r < 0)
+                else if (r < 0) {
+                    if (send_metrics) send_metrics->send_zc_fail++;
                     continue;
-                else
+                } else {
+                    if (send_metrics) { send_metrics->send_zc_ok++; send_metrics->send_bytes += need; }
                     continue;
+                }
             }
 
             // ── plain send 路径 ──
@@ -121,6 +145,7 @@ int main(int argc, char* argv[])
                     break;
                 }
             }
+            if (send_metrics) send_metrics->send_bytes += sent;
         }
     });
 
@@ -139,6 +164,8 @@ int main(int argc, char* argv[])
     write(STDOUT_FILENO, "snapshot done\n", 14);
 
     if (zc_ok) io_uring_queue_exit(&send_uring);
+    munmap(shared, sizeof(SharedMetrics));
+    shm_unlink(shm_path);
     close(wake_fd);
     return 0;
 }

@@ -10,6 +10,7 @@
 #include "io_uring_poller.h"
 #include "matching_engine.h"
 #include "protocol.h"
+#include "metrics.h"
 
 // 连接上下文：读缓冲（仅 IO+Matching 线程使用）
 struct ConnContext
@@ -40,7 +41,8 @@ public:
         int port,
         MatchingEngine& engine,
         SPSCByteRing<RING_SIZE>& resp_ring,
-        int wake_fd
+        int wake_fd,
+        IOCounters* metrics
     );
 
     ~TcpServer();
@@ -75,4 +77,5 @@ private:
     IoUringPoller poller_;
     std::unordered_map<int, ConnContext*> conns_;
     std::list<ConnContext*> pending_closes_;  // 等待 Send 确认的关闭连接（尾插，老的在队首）
+    IOCounters* metrics_ = nullptr;     // 指向 shared.io
 };
