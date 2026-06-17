@@ -13,9 +13,15 @@ public:
         : storage_(new Order[capacity])
         , capacity_(capacity)
     {
-        for (uint32_t i = 0; i < capacity_ - 1; ++i)
-            storage_[i].pool_next_free = i + 1;
-        storage_[capacity_ - 1].pool_next_free = UINT32_MAX;
+        initFreeList();
+    }
+
+    // 使用外部 mmap 存储（共享内存）
+    OrderPool(Order* external_storage, size_t capacity, bool init_free)
+        : storage_(external_storage)
+        , capacity_(capacity)
+    {
+        if (init_free) initFreeList();
     }
 
     ~OrderPool() { delete[] storage_; }
@@ -55,7 +61,25 @@ public:
     size_t capacity() const { return capacity_; }
     size_t size() const { return size_; }
 
+    // 从头扫描 storage 重建空闲链表（崩溃恢复用）
+    // 全部槽位加入 free list，addOrder 时重新分配
+    void rebuildFreelist() {
+        for (uint32_t i = 0; i < capacity_ - 1; i++)
+            storage_[i].pool_next_free = i + 1;
+        storage_[capacity_ - 1].pool_next_free = UINT32_MAX;
+        free_head_ = 0;
+        size_ = 0;
+    }
+
 private:
+    void initFreeList() {
+        for (uint32_t i = 0; i < capacity_ - 1; ++i)
+            storage_[i].pool_next_free = i + 1;
+        storage_[capacity_ - 1].pool_next_free = UINT32_MAX;
+        free_head_ = 0;
+        size_ = 0;
+    }
+
     Order* const storage_;
     const size_t capacity_;
     uint32_t free_head_ = 0;

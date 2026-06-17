@@ -10,11 +10,11 @@ bool OrderBook::addOrder(const Order& order)
     if (order.side == Side::INVALID)
         return false;
 
-    Order* new_order = pool_.allocate();
+    Order* new_order = pool_->allocate();
     if (!new_order) return false;
 
     *new_order = order;
-    uint32_t idx = pool_.indexOf(new_order);
+    uint32_t idx = pool_->indexOf(new_order);
 
     PriceLevel& level = (order.side == Side::BUY)
         ? bids_[order.price]
@@ -27,7 +27,7 @@ bool OrderBook::addOrder(const Order& order)
     } else {
         new_order->prev_idx = level.tail_idx;
         new_order->next_idx = UINT32_MAX;
-        pool_.at(level.tail_idx)->next_idx = idx;
+        pool_->at(level.tail_idx)->next_idx = idx;
         level.tail_idx = idx;
     }
     level.count++;
@@ -49,7 +49,7 @@ void OrderBook::reduceOrderQty(Order* order, uint32_t amount)
 
 void OrderBook::removeOrder(Order* order)
 {
-    uint32_t idx = pool_.indexOf(order);
+    uint32_t idx = pool_->indexOf(order);
 
     auto findLevel = [&](auto& map) -> PriceLevel* {
         auto it = map.find(order->price);
@@ -62,9 +62,9 @@ void OrderBook::removeOrder(Order* order)
     PriceLevel& lvl = *level;
 
     if (order->prev_idx != UINT32_MAX)
-        pool_.at(order->prev_idx)->next_idx = order->next_idx;
+        pool_->at(order->prev_idx)->next_idx = order->next_idx;
     if (order->next_idx != UINT32_MAX)
-        pool_.at(order->next_idx)->prev_idx = order->prev_idx;
+        pool_->at(order->next_idx)->prev_idx = order->prev_idx;
     if (lvl.head_idx == idx)
         lvl.head_idx = order->next_idx;
     if (lvl.tail_idx == idx)
@@ -80,7 +80,7 @@ void OrderBook::removeOrder(Order* order)
     }
 
     order_index_.erase(order->order_id);
-    pool_.deallocate(idx);
+    pool_->deallocate(idx);
 }
 
 bool OrderBook::removeOrder(uint64_t order_id, uint64_t user_id)
@@ -99,13 +99,13 @@ Order* OrderBook::getBestBid(uint64_t exclude_user_id)
 
     if (!exclude_user_id) {
         PriceLevel& level = bids_.begin()->second;
-        return (level.count > 0) ? pool_.at(level.head_idx) : nullptr;
+        return (level.count > 0) ? pool_->at(level.head_idx) : nullptr;
     }
 
     for (auto& [price, level] : bids_) {
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            Order* o = pool_.at(idx);
+            Order* o = pool_->at(idx);
             if (o->user_id != exclude_user_id) return o;
             idx = o->next_idx;
         }
@@ -119,13 +119,13 @@ Order* OrderBook::getBestAsk(uint64_t exclude_user_id)
 
     if (!exclude_user_id) {
         PriceLevel& level = asks_.begin()->second;
-        return (level.count > 0) ? pool_.at(level.head_idx) : nullptr;
+        return (level.count > 0) ? pool_->at(level.head_idx) : nullptr;
     }
 
     for (auto& [price, level] : asks_) {
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            Order* o = pool_.at(idx);
+            Order* o = pool_->at(idx);
             if (o->user_id != exclude_user_id) return o;
             idx = o->next_idx;
         }
@@ -168,8 +168,8 @@ void OrderBook::printBook(int levels) const
         uint32_t total_vol = 0;
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            total_vol += pool_.at(idx)->remaining_qty;
-            idx = pool_.at(idx)->next_idx;
+            total_vol += pool_->at(idx)->remaining_qty;
+            idx = pool_->at(idx)->next_idx;
         }
         printf("%d : price = %" PRIu32 "  ->  total = %" PRIu32 "\n",
                ask_count, price, total_vol);
@@ -183,8 +183,8 @@ void OrderBook::printBook(int levels) const
         uint32_t total_vol = 0;
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            total_vol += pool_.at(idx)->remaining_qty;
-            idx = pool_.at(idx)->next_idx;
+            total_vol += pool_->at(idx)->remaining_qty;
+            idx = pool_->at(idx)->next_idx;
         }
         printf("%d : price = %" PRIu32 "  ->  total = %" PRIu32 "\n",
                bid_count, price, total_vol);
@@ -205,8 +205,8 @@ std::string OrderBook::getBookString(int levels) const
         uint32_t total_vol = 0;
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            total_vol += pool_.at(idx)->remaining_qty;
-            idx = pool_.at(idx)->next_idx;
+            total_vol += pool_->at(idx)->remaining_qty;
+            idx = pool_->at(idx)->next_idx;
         }
         oss << ask_count << " : price = " << price
             << "  ->  total = " << total_vol << "\n";
@@ -220,8 +220,8 @@ std::string OrderBook::getBookString(int levels) const
         uint32_t total_vol = 0;
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            total_vol += pool_.at(idx)->remaining_qty;
-            idx = pool_.at(idx)->next_idx;
+            total_vol += pool_->at(idx)->remaining_qty;
+            idx = pool_->at(idx)->next_idx;
         }
         oss << bid_count << " : price = " << price
             << "  ->  total = " << total_vol << "\n";
@@ -244,7 +244,7 @@ uint64_t OrderBook::saveSnapshot(const char* path) const
     for (auto& [price, level] : bids_) {
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            const Order* o = pool_.at(idx);
+            const Order* o = pool_->at(idx);
             if (o->sequence > max_seq) max_seq = o->sequence;
             if (o->order_id  > max_id) max_id  = o->order_id;
             write(fd, o, sizeof(Order));
@@ -254,7 +254,7 @@ uint64_t OrderBook::saveSnapshot(const char* path) const
     for (auto& [price, level] : asks_) {
         uint32_t idx = level.head_idx;
         while (idx != UINT32_MAX) {
-            const Order* o = pool_.at(idx);
+            const Order* o = pool_->at(idx);
             if (o->sequence > max_seq) max_seq = o->sequence;
             if (o->order_id  > max_id) max_id  = o->order_id;
             write(fd, o, sizeof(Order));

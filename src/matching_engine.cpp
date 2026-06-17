@@ -1,7 +1,12 @@
 #include "matching_engine.h"
 #include "logger.h"
+#include "wal.h"
+#include "trade_pool.h"
 #include <algorithm>
 #include <cstdint>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 
 void MatchingEngine::processNewOrder(
     Side side,
@@ -41,6 +46,16 @@ void MatchingEngine::processNewOrder(
     order.sequence      = next_sequence_++;
     order.status        = OrderStatus::OPEN;
 
+    // ── WAL ──
+    if (wal_) {
+        WalEntry e;
+        e.type = 0x01; e.side = (side == Side::BUY) ? 0x01 : 0x02;
+        e.price = price; e.quantity = quantity;
+        e.user_id = user_id; e.order_id = order.order_id;
+        e.wal_seq = next_sequence_;
+        wal_->append(e);
+    }
+
     if (side == Side::BUY)
         matchBuyOrder(order, out);
     else
@@ -67,6 +82,7 @@ void MatchingEngine::processNewOrder(
         rsp.type = RSP_FILLED;
         rsp.data.ack.order_id = order.order_id;
     }
+
 }
 
 void MatchingEngine::processCancel(
@@ -75,6 +91,17 @@ void MatchingEngine::processCancel(
     std::vector<BinaryResponse>& out)
 {
     if (metrics_) metrics_->cancels++;
+
+    // ── WAL ──
+    if (wal_) {
+        WalEntry e;
+        e.type = 0x02; e.side = 0;
+        e.price = 0; e.quantity = 0;
+        e.user_id = user_id; e.order_id = order_id;
+        e.wal_seq = next_sequence_;
+        wal_->append(e);
+    }
+
     bool removed = order_book_.removeOrder(order_id, user_id);
 
     auto& rsp = out.emplace_back();
@@ -96,6 +123,83 @@ void MatchingEngine::saveSnapshot(const char* path) const
     order_book_.saveSnapshot(path);
 }
 
+void MatchingEngine::recoverFromWal(const char* wal_path)
+{
+    WalReader reader;
+    if (!reader.open(wal_path)) {
+        LOG_WARN("no WAL to replay");
+        return;
+    }
+
+    size_t n = reader.entryCount();
+    if (n > WAL_ENTRIES) n = WAL_ENTRIES;
+    for (size_t i = 0; i < n; i++) {
+        auto* entry = reader.entryAt(i);
+        if (!entry) break;
+
+        // 幂等回放
+        if (entry->type == 0x01) {  // NEW
+            if (order_book_.findOrder(entry->order_id)) continue;
+
+            Order order;
+            order.user_id = entry->user_id;
+            order.order_id = entry->order_id;
+            order.side = (entry->side == 0x01) ? Side::BUY : Side::SELL;
+            order.price = entry->price;
+            order.original_qty = entry->quantity;
+            order.remaining_qty = entry->quantity;
+            order.sequence = entry->wal_seq;
+            order.status = OrderStatus::OPEN;
+
+            // 按 NEW → CANCEL 的顺序回放，CANCEL 在下一步处理
+            // 先尝试撮合
+            std::vector<BinaryResponse> tmp;
+            if (order.side == Side::BUY) matchBuyOrder(order, tmp);
+            else matchSellOrder(order, tmp);
+
+            if (order.status == OrderStatus::OPEN || order.status == OrderStatus::PARTIALLY_FILLED)
+                order_book_.addOrder(order);
+            // FILLED 订单不加入池
+        } else if (entry->type == 0x02) {  // CANCEL
+            order_book_.removeOrder(entry->order_id, entry->user_id);
+        }
+
+        if (entry->wal_seq >= next_sequence_) next_sequence_ = entry->wal_seq + 1;
+        if (entry->order_id >= next_order_id_) next_order_id_ = entry->order_id + 1;
+    }
+
+    LOG_INFO("WAL replay: %zu entries, orders=%zu", n, order_book_.poolUsage());
+    if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
+    reader.close();
+}
+
+void MatchingEngine::recoverFromShared(Order* storage, size_t capacity)
+{
+    // 重建空闲链表：order_id==0 的槽位视为空闲
+    order_book_.getPool().rebuildFreelist();
+
+    // 遍历池，取出活跃订单逐个 addOrder（重建 bids_/asks_ + order_index_）
+    // 实际 pool 中已有数据，addOrder 会 allocate 相同 slot 并覆盖
+    uint64_t count = 0;
+    for (size_t i = 0; i < capacity; i++) {
+        Order& o = storage[i];
+        if (o.order_id == 0) continue;          // 空闲槽
+        if (o.status == OrderStatus::FILLED ||
+            o.status == OrderStatus::CANCELLED) continue;
+
+        Order copy = o;
+        copy.prev_idx = UINT32_MAX;
+        copy.next_idx = UINT32_MAX;
+        if (order_book_.addOrder(copy))
+            count++;
+
+        if (o.order_id >= next_order_id_) next_order_id_ = o.order_id + 1;
+        if (o.sequence >= next_sequence_) next_sequence_ = o.sequence + 1;
+    }
+    LOG_INFO("recovered %lu orders from shared memory", count);
+    if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
+}
+
 void MatchingEngine::loadSnapshot(const char* path)
 {
     uint64_t max_seq = 0, max_id = 0;
@@ -105,6 +209,26 @@ void MatchingEngine::loadSnapshot(const char* path)
     LOG_INFO("snapshot loaded: orders=%lu seq=%lu id=%lu",
              order_book_.poolUsage(), next_sequence_, next_order_id_);
     if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
+}
+
+void MatchingEngine::checkpointIfNeeded() {
+    if (!wal_ || !book_base_ || book_size_ == 0) return;
+    if (!wal_->needCheckpoint()) return;
+
+    LOG_INFO("WAL near wrap, checkpoint (total=%lu)", wal_->totalWritten());
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open("/tmp/nebulaX_checkpoint.dat", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd >= 0) {
+            write(fd, book_base_, book_size_);
+            uint64_t pos = wal_->curPosition();
+            write(fd, &pos, sizeof(pos));
+            close(fd);
+        }
+        _exit(0);
+    }
+    // 父进程不 waitpid，子进程变僵尸，下次 tick 收割
 }
 
 void MatchingEngine::getBook(BinaryResponse& out) const
@@ -146,6 +270,21 @@ void MatchingEngine::matchBuyOrder(Order& order, std::vector<BinaryResponse>& ou
             rsp.data.trade.buy_order_id  = order.order_id;
             rsp.data.trade.sell_order_id = best_ask->order_id;
             if (metrics_) metrics_->trades++;
+
+            // 写 TradePool
+            if (trade_pool_) {
+                static uint64_t trade_id = 0;
+                auto idx = trade_pool_->write_idx.fetch_add(1, std::memory_order_relaxed) % TRADE_CAPACITY;
+                auto& t = trade_pool_->entries[idx];
+                t.trade_id = ++trade_id;
+                t.buy_order_id = order.order_id;
+                t.sell_order_id = best_ask->order_id;
+                t.price = best_ask->price;
+                t.quantity = trade_qty;
+                t.buyer_id = order.user_id;
+                t.seller_id = best_ask->user_id;
+                t.seq = next_sequence_;
+            }
         }
 
         if (best_ask->remaining_qty == 0)
@@ -192,6 +331,21 @@ void MatchingEngine::matchSellOrder(Order& order, std::vector<BinaryResponse>& o
             rsp.data.trade.buy_order_id  = best_bid->order_id;
             rsp.data.trade.sell_order_id = order.order_id;
             if (metrics_) metrics_->trades++;
+
+            // 写 TradePool
+            if (trade_pool_) {
+                static uint64_t trade_id = 0;
+                auto idx = trade_pool_->write_idx.fetch_add(1, std::memory_order_relaxed) % TRADE_CAPACITY;
+                auto& t = trade_pool_->entries[idx];
+                t.trade_id = ++trade_id;
+                t.buy_order_id = best_bid->order_id;
+                t.sell_order_id = order.order_id;
+                t.price = best_bid->price;
+                t.quantity = trade_qty;
+                t.buyer_id = best_bid->user_id;
+                t.seller_id = order.user_id;
+                t.seq = next_sequence_;
+            }
         }
 
         if (best_bid->remaining_qty == 0)

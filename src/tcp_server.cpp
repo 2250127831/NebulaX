@@ -3,6 +3,7 @@
 #include "logger.h"
 
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
@@ -12,8 +13,10 @@
 TcpServer::TcpServer(int port, MatchingEngine& engine,
                      SPSCByteRing<RING_SIZE>& resp_ring,
                      int wake_fd,
-                     IOCounters* metrics)
+                     IOCounters* metrics,
+                     uint64_t* io_heartbeat, uint64_t* send_heartbeat)
     : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd), metrics_(metrics)
+    , io_heartbeat_(io_heartbeat), send_heartbeat_(send_heartbeat)
 {
     // ── create server socket (non-blocking) ──
     server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -83,6 +86,7 @@ void TcpServer::start()
     poller_.submit_accept(server_fd_);
 
     while (!ShutdownGuard::isStopping()) {
+        if (io_heartbeat_) (*io_heartbeat_)++;
         int ret = poller_.submit_and_wait_timeout(500);
         if (ret < 0) {
             if (errno == EINTR) continue;
@@ -273,6 +277,29 @@ void TcpServer::logSummary()
         metrics_->order_pool_capacity > 0
             ? 100.0 * metrics_->order_pool_used / metrics_->order_pool_capacity
             : 0.0);
+
+    // 检查 WAL 是否需要 checkpoint
+    engine_.checkpointIfNeeded();
+
+    // 收割已退出的 checkpoint 子进程
+    waitpid(-1, nullptr, WNOHANG);
+
+    // Send 线程存活检测：每 3 次 tick 检查一次
+    if (send_heartbeat_ && io_heartbeat_) {
+        static uint64_t last_send_hb = 0;
+        static int stall_count = 0;
+        if (*send_heartbeat_ == last_send_hb) {
+            if (++stall_count >= 3) {
+                // 尝试唤醒 send 线程
+                uint64_t one = 1;
+                write(wake_fd_, &one, sizeof(one));
+                stall_count = 0;
+            }
+        } else {
+            last_send_hb = *send_heartbeat_;
+            stall_count = 0;
+        }
+    }
 }
 
 void TcpServer::drainPendingClose()

@@ -1,6 +1,9 @@
 #include "matching_engine.h"
 #include "protocol.h"
 #include "tcp_server.h"
+#include "wal.h"
+#include "trade_pool.h"
+#include "crash_guard.h"
 
 #include <csignal>
 #include <thread>
@@ -13,6 +16,8 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -21,6 +26,18 @@
 #include "shutdown_guard.h"
 #include "metrics.h"
 #include "logger.h"
+
+// ── 共享内存布局（除 metrics 外的第二块共享内存）──
+static constexpr size_t ORDERS_SIZE = (4 << 20) * sizeof(Order);          // 4M × 64B
+static constexpr size_t TRADES_SIZE = sizeof(TradePool);                   // 84MB
+static constexpr size_t META_SIZE   = 64;                                  // 心跳 + wal_seq
+static constexpr size_t BOOK_SIZE   = ORDERS_SIZE + TRADES_SIZE + META_SIZE;
+
+struct BookMeta {
+    uint64_t io_heartbeat;
+    uint64_t send_heartbeat;
+    uint64_t last_wal_seq;
+};
 
 int main(int argc, char* argv[])
 {
@@ -40,9 +57,34 @@ int main(int argc, char* argv[])
     signal(SIGPIPE, SIG_IGN);
     ShutdownGuard::install();
     Logger::instance().init("../logs", LOG_INFO);
-    LOG_INFO("NebulaX starting on port %d", port);
 
-    // ── 共享内存 —— 暴露性能计数器 ──
+    // ── 共享内存 —— 订单簿数据 ──
+    bool book_recovered = false;  // 从崩溃中恢复？
+    int book_fd = shm_open("/nebulaX_book", O_CREAT | O_RDWR, 0644);
+    if (book_fd < 0) { LOG_ERROR("book shm_open failed"); return 1; }
+
+    off_t book_size = lseek(book_fd, 0, SEEK_END);
+    bool fresh_start = (book_size == 0);
+    ftruncate(book_fd, BOOK_SIZE);
+
+    // mmap 集群：OrderPool 起始 + TradePool + Meta
+    uint8_t* book_base = (uint8_t*)mmap(nullptr, BOOK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, book_fd, 0);
+    close(book_fd);
+    if (book_base == MAP_FAILED) { LOG_ERROR("book mmap failed"); return 1; }
+
+    Order*    order_storage = (Order*)book_base;
+    TradePool* trade_pool   = (TradePool*)(book_base + ORDERS_SIZE);
+    BookMeta*  meta          = (BookMeta*)(book_base + ORDERS_SIZE + TRADES_SIZE);
+
+    // 首次启动时初始化 OrderPool 空闲链表
+    OrderPool order_pool(order_storage, 4 << 20, fresh_start);
+
+    if (!fresh_start) {
+        LOG_INFO("recovered shared memory: orders=%lu", order_pool.size());
+        book_recovered = true;
+    }
+
+    // ── 共享内存 —— 性能计数器 ──
     const char* shm_path = "/nebulaX_metrics";
     int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0644);
     if (shm_fd < 0) { LOG_ERROR("shm_open failed"); return 1; }
@@ -52,8 +94,28 @@ int main(int argc, char* argv[])
     close(shm_fd);
     if (shared == MAP_FAILED) { LOG_ERROR("mmap failed"); return 1; }
 
-    MatchingEngine engine(shared ? &shared->io : nullptr);
-    engine.loadSnapshot("/tmp/nebulaX_snapshot.dat");
+    // ── WAL ──
+    WalWriter wal;
+    if (!wal.init()) {
+        LOG_ERROR("WAL init failed");
+    }
+
+    // ── MatchingEngine（共享内存中的 OrderPool）──
+    // 需要传入 OrderPool* 重构 OrderBook。当前 OrderBook 内部有自己的 pool_，
+    // 先跳过重建（保留外部 order_pool 指针供后续使用）
+    MatchingEngine engine(&order_pool, shared ? &shared->io : nullptr);
+    engine.wal_ = &wal;
+    engine.trade_pool_ = trade_pool;
+    engine.book_base_ = book_base;
+    engine.book_size_ = BOOK_SIZE;
+
+    // 恢复
+    if (book_recovered) {
+        engine.recoverFromShared(order_storage, 4 << 20);
+    } else {
+        engine.recoverFromWal("/tmp/nebulaX_wal.dat");
+    }
+
     SPSCByteRing<RING_SIZE> ring;
 
     // ── 初始化 io_uring（可选，仅用于 SEND_ZC）──
@@ -62,10 +124,10 @@ int main(int argc, char* argv[])
     std::atomic<bool> io_shutdown_done{false};
 
     int wake_fd = eventfd(0, 0);
-    if (wake_fd < 0) {
-        LOG_ERROR("eventfd() failed");
-        return 1;
-    }
+    if (wake_fd < 0) { LOG_ERROR("eventfd() failed"); return 1; }
+
+    // ── 崩溃 handler（传入 WAL fd，崩溃时刷盘）──
+    CrashGuard::install(wal.fd());
 
     // ── IO+Matching 线程 ──
     std::thread io_thread([&]() {
@@ -76,7 +138,8 @@ int main(int argc, char* argv[])
             pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
         }
         if (shared) shared->io_thread_pid = static_cast<uint64_t>(syscall(SYS_gettid));
-        TcpServer server(port, engine, ring, wake_fd, shared ? &shared->io : nullptr);
+        TcpServer server(port, engine, ring, wake_fd, shared ? &shared->io : nullptr,
+                         &meta->io_heartbeat, &meta->send_heartbeat);
         server.start();
     });
 
@@ -94,11 +157,17 @@ int main(int argc, char* argv[])
         if (shared) shared->send_thread_pid = static_cast<uint64_t>(syscall(SYS_gettid));
 
         while (!io_shutdown_done) {
+            if (meta) meta->send_heartbeat++;
+
             uint8_t hdr[48];
             if (ring.pop(hdr, 48) == 0) {
                 if (io_shutdown_done) break;
-                uint64_t val;
-                read(wake_fd, &val, 8);
+                // poll 1s 超时，既等数据又维持心跳
+                struct pollfd pfd = {wake_fd, POLLIN, 0};
+                if (poll(&pfd, 1, 1000) > 0) {
+                    uint64_t ev;
+                    read(wake_fd, &ev, 8);
+                }
                 continue;
             }
 
@@ -150,12 +219,12 @@ int main(int argc, char* argv[])
             }
             if (send_metrics) send_metrics->send_bytes += sent;
         }
+
     });
 
-    // 等待 IO 线程退出（start() 内部已排空 ring）
+    // 等待 IO 线程退出
     io_thread.join();
     io_shutdown_done = true;
-    // 唤醒 Send 线程，它会看到 io_shutdown_done 后退出
     {
         uint64_t val = 1;
         write(wake_fd, &val, sizeof(val));
@@ -166,9 +235,13 @@ int main(int argc, char* argv[])
     engine.saveSnapshot("/tmp/nebulaX_snapshot.dat");
     LOG_INFO("snapshot done");
 
+    // ── 清理 ──
+    wal.close();
     if (zc_ok) io_uring_queue_exit(&send_uring);
     munmap(shared, sizeof(SharedMetrics));
     shm_unlink(shm_path);
+    munmap(book_base, BOOK_SIZE);
+    shm_unlink("/nebulaX_book");
     close(wake_fd);
     Logger::instance().shutdown();
     return 0;

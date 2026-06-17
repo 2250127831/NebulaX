@@ -42,7 +42,9 @@ public:
         MatchingEngine& engine,
         SPSCByteRing<RING_SIZE>& resp_ring,
         int wake_fd,
-        IOCounters* metrics
+        IOCounters* metrics,
+        uint64_t* io_heartbeat = nullptr,
+        uint64_t* send_heartbeat = nullptr
     );
 
     ~TcpServer();
@@ -79,5 +81,7 @@ private:
     std::unordered_map<int, ConnContext*> conns_;
     std::list<ConnContext*> pending_closes_;  // 等待 Send 确认的关闭连接（尾插，老的在队首）
     IOCounters* metrics_ = nullptr;     // 指向 shared.io
+    uint64_t*   io_heartbeat_ = nullptr;
+    uint64_t*   send_heartbeat_ = nullptr;
     uint64_t summary_last_orders_ = 0;
 };
