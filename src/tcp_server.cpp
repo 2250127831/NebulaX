@@ -1,5 +1,6 @@
 #include "tcp_server.h"
 #include "shutdown_guard.h"
+#include "logger.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,7 +18,7 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
     // ── create server socket (non-blocking) ──
     server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (server_fd_ < 0) {
-        write(STDERR_FILENO, "ERROR: socket() failed\n", 23);
+        LOG_ERROR("socket() failed");
         return;
     }
 
@@ -29,39 +30,28 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port_);
     if (bind(server_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        write(STDERR_FILENO, "ERROR: bind() failed\n", 21);
+        LOG_ERROR("bind() failed");
         close(server_fd_);
         server_fd_ = -1;
         return;
     }
 
     if (listen(server_fd_, 10) < 0) {
-        write(STDERR_FILENO, "ERROR: listen() failed\n", 23);
+        LOG_ERROR("listen() failed");
         close(server_fd_);
         server_fd_ = -1;
         return;
     }
 
     if (!poller_.ok()) {
-        write(STDERR_FILENO, "ERROR: io_uring_queue_init() failed\n", 37);
+        LOG_ERROR("io_uring_queue_init() failed");
         close(server_fd_);
         server_fd_ = -1;
         return;
     }
 
-    const char msg[] = "NebulaX server listening on port ";
-    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-    char pbuf[16];
-    int len = 0;
-    int tmp = port_;
-    do { pbuf[len++] = '0' + tmp % 10; tmp /= 10; } while (tmp);
-    for (int i = 0; i < len / 2; ++i) {
-        char c = pbuf[i];
-        pbuf[i] = pbuf[len - 1 - i];
-        pbuf[len - 1 - i] = c;
-    }
-    write(STDOUT_FILENO, pbuf, len);
-    write(STDOUT_FILENO, "\n", 1);
+    write(STDOUT_FILENO, "NebulaX online\n", 15);
+    LOG_INFO("listening on port %d", port_);
 }
 
 TcpServer::~TcpServer()
@@ -85,7 +75,7 @@ TcpServer::~TcpServer()
 void TcpServer::start()
 {
     if (server_fd_ < 0) {
-        write(STDERR_FILENO, "ERROR: server not initialized\n", 30);
+        LOG_ERROR("server not initialized");
         return;
     }
 
@@ -96,7 +86,7 @@ void TcpServer::start()
         int ret = poller_.submit_and_wait_timeout(500);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            write(STDERR_FILENO, "ERROR: io_uring_submit_and_wait() failed\n", 42);
+            LOG_ERROR("io_uring_submit_and_wait() failed (errno=%d)", errno);
             break;
         }
 
@@ -125,7 +115,7 @@ void TcpServer::start()
 
                 if (bytes_read < 0) {
                     if (bytes_read != -ECONNRESET && bytes_read != -EPIPE) {
-                        write(STDERR_FILENO, "unexpected recv error\n", 22);
+                        LOG_ERROR("recv err %d on fd %d", bytes_read, fd);
                         if (metrics_) metrics_->errors++;
                     }
                 }
@@ -140,6 +130,7 @@ void TcpServer::start()
         );
 
         drainPendingClose();
+        logSummary();
     }
 
     // ── 优雅关闭 ──
@@ -268,6 +259,20 @@ void TcpServer::closeConnection(ConnContext* conn)
 
     // 移入 pending close 列表，等 Send 确认后再回收
     pending_closes_.push_back(conn);
+}
+
+void TcpServer::logSummary()
+{
+    if (!metrics_ || metrics_->new_orders < 1000) return;
+    if (metrics_->new_orders - summary_last_orders_ < 1000) return;
+    summary_last_orders_ = metrics_->new_orders;
+
+    LOG_INFO("orders: %lu  trades: %lu  pool: %lu/%lu (%.1f%%)",
+        metrics_->new_orders, metrics_->trades,
+        metrics_->order_pool_used, metrics_->order_pool_capacity,
+        metrics_->order_pool_capacity > 0
+            ? 100.0 * metrics_->order_pool_used / metrics_->order_pool_capacity
+            : 0.0);
 }
 
 void TcpServer::drainPendingClose()

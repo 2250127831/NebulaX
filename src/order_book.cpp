@@ -1,4 +1,5 @@
 #include "order_book.h"
+#include "logger.h"
 #include <inttypes.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -283,11 +284,9 @@ void OrderBook::loadSnapshot(const char* path, uint64_t& max_seq_out, uint64_t& 
         if (o.sequence > max_seq_out) max_seq_out = o.sequence;
         if (o.order_id  > max_id_out) max_id_out  = o.order_id;
         if (!addOrder(o))
-            write(STDERR_FILENO, "loadSnapshot: addOrder failed\n", 30);
+            LOG_ERROR("loadSnapshot: addOrder failed");
         loaded++;
     }
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf), "loadSnapshot: %u orders\n", loaded);
-    write(STDERR_FILENO, buf, n);
+    LOG_INFO("loadSnapshot: %u orders", loaded);
     close(fd);
 }

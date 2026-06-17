@@ -1,4 +1,5 @@
 #include "matching_engine.h"
+#include "logger.h"
 #include <algorithm>
 #include <cstdint>
 
@@ -101,7 +102,8 @@ void MatchingEngine::loadSnapshot(const char* path)
     order_book_.loadSnapshot(path, max_seq, max_id);
     if (max_seq > 0) next_sequence_ = max_seq + 1;
     if (max_id  > 0) next_order_id_ = max_id + 1;
-    printf("loadSnapshot: seq=%lu id=%lu\n", next_sequence_, next_order_id_);
+    LOG_INFO("snapshot loaded: orders=%lu seq=%lu id=%lu",
+             order_book_.poolUsage(), next_sequence_, next_order_id_);
     if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
 }
 

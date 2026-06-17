@@ -59,6 +59,7 @@ private:
 
     void closeConnection(ConnContext* conn);
     void drainPendingClose();
+    void logSummary();
     void pushResponses(int fd, const std::vector<BinaryResponse>& buf);
     void notifySendThread();
 
@@ -78,4 +79,5 @@ private:
     std::unordered_map<int, ConnContext*> conns_;
     std::list<ConnContext*> pending_closes_;  // 等待 Send 确认的关闭连接（尾插，老的在队首）
     IOCounters* metrics_ = nullptr;     // 指向 shared.io
+    uint64_t summary_last_orders_ = 0;
 };

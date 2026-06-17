@@ -20,6 +20,7 @@
 #include "send_uring.h"
 #include "shutdown_guard.h"
 #include "metrics.h"
+#include "logger.h"
 
 int main(int argc, char* argv[])
 {
@@ -38,16 +39,18 @@ int main(int argc, char* argv[])
 
     signal(SIGPIPE, SIG_IGN);
     ShutdownGuard::install();
+    Logger::instance().init("../logs", LOG_INFO);
+    LOG_INFO("NebulaX starting on port %d", port);
 
     // ── 共享内存 —— 暴露性能计数器 ──
     const char* shm_path = "/nebulaX_metrics";
     int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0644);
-    if (shm_fd < 0) { write(STDERR_FILENO, "ERROR: shm_open failed\n", 23); return 1; }
+    if (shm_fd < 0) { LOG_ERROR("shm_open failed"); return 1; }
     ftruncate(shm_fd, sizeof(SharedMetrics));
     auto* shared = static_cast<SharedMetrics*>(mmap(nullptr, sizeof(SharedMetrics),
         PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
     close(shm_fd);
-    if (shared == MAP_FAILED) { write(STDERR_FILENO, "ERROR: mmap failed\n", 19); return 1; }
+    if (shared == MAP_FAILED) { LOG_ERROR("mmap failed"); return 1; }
 
     MatchingEngine engine(shared ? &shared->io : nullptr);
     engine.loadSnapshot("/tmp/nebulaX_snapshot.dat");
@@ -60,7 +63,7 @@ int main(int argc, char* argv[])
 
     int wake_fd = eventfd(0, 0);
     if (wake_fd < 0) {
-        write(STDERR_FILENO, "ERROR: eventfd() failed\n", 24);
+        LOG_ERROR("eventfd() failed");
         return 1;
     }
 
@@ -159,13 +162,14 @@ int main(int argc, char* argv[])
     }
     send_thread.join();
 
-    write(STDOUT_FILENO, "saving snapshot...\n", 19);
+    LOG_INFO("saving snapshot...");
     engine.saveSnapshot("/tmp/nebulaX_snapshot.dat");
-    write(STDOUT_FILENO, "snapshot done\n", 14);
+    LOG_INFO("snapshot done");
 
     if (zc_ok) io_uring_queue_exit(&send_uring);
     munmap(shared, sizeof(SharedMetrics));
     shm_unlink(shm_path);
     close(wake_fd);
+    Logger::instance().shutdown();
     return 0;
 }
