@@ -28,11 +28,15 @@ target_link_options(nebulaX PRIVATE
 find_package(Threads REQUIRED)
 target_link_libraries(nebulaX PRIVATE Threads::Threads)
 
-# io_uring（静态链接 $HOME/.local/lib/liburing.a 2.4，避免系统旧版干扰）
+# io_uring（优先静态链接，回退到系统 liburing）
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBURING REQUIRED liburing)
 target_include_directories(nebulaX PRIVATE ${LIBURING_INCLUDE_DIRS})
-target_link_libraries(nebulaX PRIVATE $ENV{HOME}/.local/lib/liburing.a)
+if (LIBURING_STATIC_LIBRARIES)
+    target_link_libraries(nebulaX PRIVATE ${LIBURING_STATIC_LIBRARIES})
+else()
+    target_link_libraries(nebulaX PRIVATE ${LIBURING_LIBRARIES})
+endif()
 
 # ── 单元测试 ──
 add_executable(test_unit test/test_unit.cpp src/order_book.cpp src/logger.cpp)
