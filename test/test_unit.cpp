@@ -225,6 +225,29 @@ void test_order_map() {
     assert(map.find(10) == nullptr);
     assert(map.find(20) == &b);
     OK();
+
+    TEST("overflow to std::map after chain > 8");
+    OrderMap small(8);  // 8 nodes, 8 buckets
+    Order buf[15];
+    for (int i = 0; i < 12; i++) {
+        buf[i].order_id = i + 1;
+        small.insert(i + 1, &buf[i]);
+    }
+    int ok = 0;
+    for (int i = 0; i < 12; i++)
+        if (small.find(i + 1) == &buf[i]) ok++;
+    assert(ok == 12);
+    // erase from both chain and overflow
+    for (int i = 1; i <= 12; i += 2) small.erase(i);
+    ok = 0;
+    for (int i = 2; i <= 12; i += 2)
+        if (small.find(i) == &buf[i - 1]) ok++;
+    assert(ok == 6);
+    // reinsert still works
+    buf[12].order_id = 100;
+    small.insert(100, &buf[12]);
+    assert(small.find(100) == &buf[12]);
+    OK();
 }
 
 // ─── TradePool ───
@@ -364,13 +387,15 @@ void test_error_codes() {
 // ─── TradePool ───
 void test_trade_pool_write() {
     TEST("TradePool ring buffer write + wrap");
-    TradePool tp;
-    auto i1 = tp.write_idx.fetch_add(1) % TRADE_CAPACITY;
-    tp.entries[i1].trade_id = 1; tp.entries[i1].price = 100;
-    auto i2 = tp.write_idx.fetch_add(1) % TRADE_CAPACITY;
-    tp.entries[i2].trade_id = 2; tp.entries[i2].price = 101;
-    assert(tp.entries[0].trade_id == 1);
-    assert(tp.entries[1].trade_id == 2);
+    // 堆分配避免栈溢出（TRADE_CAPACITY 太大）
+    auto* tp = new TradePool();
+    auto i1 = tp->write_idx.fetch_add(1) % TRADE_CAPACITY;
+    tp->entries[i1].trade_id = 1; tp->entries[i1].price = 100;
+    auto i2 = tp->write_idx.fetch_add(1) % TRADE_CAPACITY;
+    tp->entries[i2].trade_id = 2; tp->entries[i2].price = 101;
+    assert(tp->entries[0].trade_id == 1);
+    assert(tp->entries[1].trade_id == 2);
+    delete tp;
     OK();
 }
 
