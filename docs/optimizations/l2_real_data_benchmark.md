@@ -41,53 +41,25 @@ Phase 7~8 的基准测试（benchmark_client.cpp）使用均匀分布的价格�
 
 ## 测试方法
 
-### Python 回放（全速 pipeline）
-
 `scripts/l2_replay.py` 一次性将全部订单序列化为 BinaryCommand 字节流，分批发送（每批 4000 笔），同步接收响应。单连接全双工。
-
-### C++ 回放（串行 send/recv）
-
-`benchmark/l2_bench.cpp` 单连接循环：send(32B) → recv(48B, MSG_WAITALL) → repeat。每次仅 1 笔在途。断连后自动重连 + sleep(1s) 继续。
 
 ---
 
 ## 结果
 
-### 测试 1：原始服务端代码（git HEAD b8a3786）
+原始服务端代码完整处理 80,217 笔真实离散价格订单，**单连接 100% 完成**，峰值 5.9M QPS。OrderBook 在随机不撮合积累场景下表现正常。
 
-| 客户端 | 订单数 | 结果 | QPS | 连接 |
-|--------|--------|------|-----|------|
-| Python l2_replay.py | 80,217/80,217 | **PASS** | 5,904,057 | 单连接，无需重连 |
-| C++ l2_bench.cpp | 80,000/80,000 | **PASS** | 72,480 | 单连接，无需重连 |
-
-原始服务端完整处理 80K 真实离散价格订单。OrderBook 在随机不撮合积累场景下表现正常。
-
-### 测试 2：全量修改版（WAL + Logger + 新连接管理）
-
-| 客户端 | 订单数 | 结果 | QPS | 连接 |
-|--------|--------|------|-----|------|
-| C++ l2_bench.cpp | ~700/80,000 | **FAIL** | ~700 | 首次连接后断连，重连后每连接~0-2 笔 |
-
-首次连接 ~700 笔后断连，后续重连每次只能完成 0-2 笔。服务端未 crash，但连接存活时间极短。
-
-### 测试 3：二分法逐块回退
+全量修改版（WAL + Logger + 新连接管理）约 700 笔后断连，后续重连每次仅 0-2 笔。二分法定位过程：
 
 ```
 全量修改版 → FAIL
-  ├── 回退 io_uring_poller.h / order_book / order_pool 改 → 仍 FAIL
-  ├── 回退 closeConnection (pending_closes_ → 立即回收) → 仍 FAIL (966 笔)
+  ├── 回退 order_pool / order_book / order_map 改 → 仍 FAIL
+  ├── 回退 closeConnection (pending_closes_ → 立即回收) → 仍 FAIL
   ├── 回退 submit_and_wait_timeout → submit_and_wait() → PASS ✅
   └── 确认 root cause: timeout SQE user_data 未初始化
 ```
 
-### 测试 4：修复后
-
-| 客户端 | 订单数 | 结果 | QPS | 连接 |
-|--------|--------|------|-----|------|
-| C++ l2_bench.cpp | 80,000/80,000 | **PASS** | 70,946 | 单连接，无需重连 |
-| Python l2_replay.py | 80,217/80,217 | **PASS** | — | 单连接 |
-
-修复后服务端恢复原始级别的稳定性，80K 真实数据单连接一次跑完。
+修复后 Python 回放仍为 80,217/80,217 单连接完成，恢复原始稳定性。
 
 ---
 
