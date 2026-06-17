@@ -236,8 +236,12 @@ void TcpServer::onRecv(ConnContext* conn, int bytes_read)
 
     conn->compact();
 
-    if (!buf.empty())
-        pushResponses(conn->fd, buf);
+    if (!buf.empty()) {
+        if (!pushResponses(conn->fd, buf)) {
+            closeConnection(conn);
+            return;
+        }
+    }
 }
 
 void TcpServer::closeConnection(ConnContext* conn)
@@ -318,10 +322,10 @@ void TcpServer::drainPendingClose()
     }
 }
 
-void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
+bool TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
 {
     size_t count = buf.size();
-    if (count == 0) return;
+    if (count == 0) return true;
 
     size_t bytes = count * sizeof(BinaryResponse);
 
@@ -339,15 +343,14 @@ void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
                 if (sent == 0 && ++spins >= 500) break;
                 __builtin_ia32_pause();
             } else {
-                return;
+                return false;  // 连接已断开
             }
         }
-        if (sent == bytes) return;
-        if (sent > 0) return;
+        if (sent == bytes) return true;
+        if (sent > 0) return true;
     }
 
     // 正常路径：推 RSP_HEADER + 响应帧到 ring，Send 线程消费
-    // 若 ring 空间不足则 direct send（不阻塞 IO 线程）
     if (ring_.free_space() >= sizeof(BinaryResponse) + bytes) {
         BinaryResponse header;
         header.type = RSP_HEADER;
@@ -356,16 +359,19 @@ void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
         ring_.push(&header, sizeof(BinaryResponse));
         ring_.push(reinterpret_cast<const uint8_t*>(buf.data()), bytes);
         notifySendThread();
-    } else {
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
-        size_t sent = 0;
-        while (sent < bytes) {
-            ssize_t r = send(fd, data + sent, bytes - sent, MSG_NOSIGNAL);
-            if (r > 0) sent += r;
-            else if (r == -1 && errno == EAGAIN) __builtin_ia32_pause();
-            else break;
-        }
+        return true;
     }
+
+    // Ring 满 → direct send 降级
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
+    size_t sent = 0;
+    while (sent < bytes) {
+        ssize_t r = send(fd, data + sent, bytes - sent, MSG_NOSIGNAL);
+        if (r > 0) sent += r;
+        else if (r == -1 && errno == EAGAIN) __builtin_ia32_pause();
+        else return false;  // 连接已断开
+    }
+    return true;
 }
 
 void TcpServer::notifySendThread()
