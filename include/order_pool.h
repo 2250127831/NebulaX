@@ -20,11 +20,12 @@ public:
     OrderPool(Order* external_storage, size_t capacity, bool init_free)
         : storage_(external_storage)
         , capacity_(capacity)
+        , owns_storage_(false)
     {
         if (init_free) initFreeList();
     }
 
-    ~OrderPool() { delete[] storage_; }
+    ~OrderPool() { if (owns_storage_) delete[] storage_; }
 
     OrderPool(const OrderPool&) = delete;
     OrderPool& operator=(const OrderPool&) = delete;
@@ -82,6 +83,7 @@ private:
 
     Order* const storage_;
     const size_t capacity_;
+    bool owns_storage_ = true;
     uint32_t free_head_ = 0;
     size_t size_ = 0;
 };

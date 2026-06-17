@@ -33,3 +33,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBURING REQUIRED liburing)
 target_include_directories(nebulaX PRIVATE ${LIBURING_INCLUDE_DIRS})
 target_link_libraries(nebulaX PRIVATE $ENV{HOME}/.local/lib/liburing.a)
+
+# ── 单元测试 ──
+add_executable(test_unit test/test_unit.cpp)
+target_link_libraries(test_unit PRIVATE Threads::Threads rt)
