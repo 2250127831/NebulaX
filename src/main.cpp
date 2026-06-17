@@ -116,7 +116,7 @@ int main(int argc, char* argv[])
         engine.recoverFromWal("/tmp/nebulaX_wal.dat");
     }
 
-    SPSCByteRing<RING_SIZE> ring;
+    SPSCByteRing<RING_SIZE>& ring = *new SPSCByteRing<RING_SIZE>();  // 堆分配防栈溢出
 
     // ── 初始化 io_uring（可选，仅用于 SEND_ZC）──
     struct io_uring send_uring{};

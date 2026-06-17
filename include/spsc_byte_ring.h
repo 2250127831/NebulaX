@@ -5,7 +5,7 @@
 #include <cstring>
 #include <sys/uio.h>
 
-constexpr size_t RING_SIZE = 1048576;  // 1 MB, 必须是 2 的幂
+constexpr size_t RING_SIZE = 8388608;  // 8 MB  // 1 MB, 必须是 2 的幂
 
 // ── SPSCByteRing: 单生产者单消费者的字节环形缓冲区 ──
 //

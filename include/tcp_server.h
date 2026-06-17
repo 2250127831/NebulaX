@@ -62,8 +62,7 @@ private:
     void closeConnection(ConnContext* conn);
     void drainPendingClose();
     void logSummary();
-    // 推送响应，返回 false 表示连接已断开（调用方应 closeConnection）
-    bool pushResponses(int fd, const std::vector<BinaryResponse>& buf);
+    void pushResponses(int fd, const std::vector<BinaryResponse>& buf);
     void notifySendThread();
 
     void processRequest(

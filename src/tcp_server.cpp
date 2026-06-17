@@ -87,7 +87,7 @@ void TcpServer::start()
 
     while (!ShutdownGuard::isStopping()) {
         if (io_heartbeat_) (*io_heartbeat_)++;
-        int ret = poller_.submit_and_wait_timeout(500);
+        int ret = poller_.submit_and_wait_timeout(server_fd_, 500);
         if (ret < 0) {
             if (errno == EINTR) continue;
             LOG_ERROR("io_uring_submit_and_wait() failed (errno=%d)", errno);
@@ -236,12 +236,8 @@ void TcpServer::onRecv(ConnContext* conn, int bytes_read)
 
     conn->compact();
 
-    if (!buf.empty()) {
-        if (!pushResponses(conn->fd, buf)) {
-            closeConnection(conn);
-            return;
-        }
-    }
+    if (!buf.empty())
+        pushResponses(conn->fd, buf);
 }
 
 void TcpServer::closeConnection(ConnContext* conn)
@@ -322,10 +318,10 @@ void TcpServer::drainPendingClose()
     }
 }
 
-bool TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
+void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
 {
     size_t count = buf.size();
-    if (count == 0) return true;
+    if (count == 0) return;
 
     size_t bytes = count * sizeof(BinaryResponse);
 
@@ -343,35 +339,25 @@ bool TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
                 if (sent == 0 && ++spins >= 500) break;
                 __builtin_ia32_pause();
             } else {
-                return false;  // 连接已断开
+                return;
             }
         }
-        if (sent == bytes) return true;
-        if (sent > 0) return true;
+        if (sent == bytes) return;
+        if (sent > 0) return;
     }
 
-    // 正常路径：推 RSP_HEADER + 响应帧到 ring，Send 线程消费
-    if (ring_.free_space() >= sizeof(BinaryResponse) + bytes) {
-        BinaryResponse header;
-        header.type = RSP_HEADER;
-        header.data.header.client_fd = fd;
-        header.data.header.count = count;
-        ring_.push(&header, sizeof(BinaryResponse));
-        ring_.push(reinterpret_cast<const uint8_t*>(buf.data()), bytes);
+    // 推 RSP_HEADER + 响应帧到 ring，满则等空间不 direct send
+    while (ring_.free_space() < sizeof(BinaryResponse) + bytes) {
         notifySendThread();
-        return true;
+        __builtin_ia32_pause();
     }
-
-    // Ring 满 → direct send 降级
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
-    size_t sent = 0;
-    while (sent < bytes) {
-        ssize_t r = send(fd, data + sent, bytes - sent, MSG_NOSIGNAL);
-        if (r > 0) sent += r;
-        else if (r == -1 && errno == EAGAIN) __builtin_ia32_pause();
-        else return false;  // 连接已断开
-    }
-    return true;
+    BinaryResponse header;
+    header.type = RSP_HEADER;
+    header.data.header.client_fd = fd;
+    header.data.header.count = count;
+    ring_.push(&header, sizeof(BinaryResponse));
+    ring_.push(reinterpret_cast<const uint8_t*>(buf.data()), bytes);
+    notifySendThread();
 }
 
 void TcpServer::notifySendThread()
