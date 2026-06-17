@@ -1,0 +1,28 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq liburing-dev libpthread-stubs0-dev
+
+      - name: Build
+        run: |
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) nebulaX test_unit
+
+      - name: Unit tests
+        run: |
+          cd build && ./test_unit
+
+      - name: Integration tests
+        run: |
+          python3 scripts/test_integration.py
