@@ -81,6 +81,7 @@ void MatchingEngine::processNewOrder(
         auto& rsp = out.emplace_back();
         rsp.type = RSP_FILLED;
         rsp.data.ack.order_id = order.order_id;
+        if (metrics_) metrics_->order_pool_used = order_book_.poolUsage();
     }
 
 }
