@@ -325,8 +325,16 @@ void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
 
     size_t bytes = count * sizeof(BinaryResponse);
 
-    // 快速路径：少量响应帧时直接 send，绕过 ring（保持 ping-pong 低延迟）
-    if (count <= 100 && ring_.free_space() == RING_SIZE) {
+    // Ring 有空间 → push 到 ring（Send 线程异步发送），否则直接 send
+    if (ring_.free_space() >= sizeof(BinaryResponse) + bytes) {
+        BinaryResponse header;
+        header.type = RSP_HEADER;
+        header.data.header.client_fd = fd;
+        header.data.header.count = count;
+        ring_.push(&header, sizeof(BinaryResponse));
+        ring_.push(reinterpret_cast<const uint8_t*>(buf.data()), bytes);
+        notifySendThread();
+    } else {
         const uint8_t* data = reinterpret_cast<const uint8_t*>(buf.data());
         size_t sent = 0;
         int spins = 0;
@@ -336,28 +344,13 @@ void TcpServer::pushResponses(int fd, const std::vector<BinaryResponse>& buf)
                 sent += r;
                 spins = 0;
             } else if (r == -1 && errno == EAGAIN) {
-                if (sent == 0 && ++spins >= 500) break;
+                if (++spins >= 500) break;
                 __builtin_ia32_pause();
             } else {
                 return;
             }
         }
-        if (sent == bytes) return;
-        if (sent > 0) return;
     }
-
-    // 推 RSP_HEADER + 响应帧到 ring，满则等空间不 direct send
-    while (ring_.free_space() < sizeof(BinaryResponse) + bytes) {
-        notifySendThread();
-        __builtin_ia32_pause();
-    }
-    BinaryResponse header;
-    header.type = RSP_HEADER;
-    header.data.header.client_fd = fd;
-    header.data.header.count = count;
-    ring_.push(&header, sizeof(BinaryResponse));
-    ring_.push(reinterpret_cast<const uint8_t*>(buf.data()), bytes);
-    notifySendThread();
 }
 
 void TcpServer::notifySendThread()
