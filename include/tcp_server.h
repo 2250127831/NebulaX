@@ -12,6 +12,13 @@
 #include "protocol.h"
 #include "metrics.h"
 
+// SPSC ring 状态快照（独立 shm），供监控端 mmap 直接读取
+struct RingStatus {
+    uint64_t tail;       // IO 线程写
+    uint64_t head;       // Send 线程写
+    uint64_t capacity;   // RING_SIZE
+};
+
 // 连接上下文：读缓冲（仅 IO+Matching 线程使用）
 struct ConnContext
 {
@@ -43,6 +50,7 @@ public:
         SPSCByteRing<RING_SIZE>& resp_ring,
         int wake_fd,
         IOCounters* metrics,
+        RingStatus* ring_status = nullptr,
         uint64_t* io_heartbeat = nullptr,
         uint64_t* send_heartbeat = nullptr
     );
@@ -81,6 +89,7 @@ private:
     std::unordered_map<int, ConnContext*> conns_;
     std::list<ConnContext*> pending_closes_;  // 等待 Send 确认的关闭连接（尾插，老的在队首）
     IOCounters* metrics_ = nullptr;     // 指向 shared.io
+    RingStatus* ring_status_ = nullptr;
     uint64_t*   io_heartbeat_ = nullptr;
     uint64_t*   send_heartbeat_ = nullptr;
     uint64_t summary_last_orders_ = 0;

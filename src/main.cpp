@@ -94,6 +94,16 @@ int main(int argc, char* argv[])
     close(shm_fd);
     if (shared == MAP_FAILED) { LOG_ERROR("mmap failed"); return 1; }
 
+    // ── SPSC ring 状态共享内存（24 bytes）──
+    int ring_fd = shm_open("/nebulaX_ring", O_CREAT | O_RDWR, 0644);
+    if (ring_fd < 0) { LOG_ERROR("ring shm_open failed"); return 1; }
+    ftruncate(ring_fd, sizeof(RingStatus));
+    auto* ring_status = static_cast<RingStatus*>(mmap(nullptr, sizeof(RingStatus),
+        PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, 0));
+    close(ring_fd);
+    if (ring_status == MAP_FAILED) { LOG_ERROR("ring mmap failed"); return 1; }
+    ring_status->capacity = RING_SIZE;
+
     // ── WAL ──
     WalWriter wal;
     if (!wal.init()) {
@@ -139,14 +149,14 @@ int main(int argc, char* argv[])
         }
         if (shared) shared->io_thread_pid = static_cast<uint64_t>(syscall(SYS_gettid));
         TcpServer server(port, engine, ring, wake_fd, shared ? &shared->io : nullptr,
-                         &meta->io_heartbeat, &meta->send_heartbeat);
+                         ring_status, &meta->io_heartbeat, &meta->send_heartbeat);
         server.start();
     });
 
     // ── Send 线程 ──
     auto* send_metrics = shared ? &shared->send : nullptr;
 
-    std::thread send_thread([&, send_metrics, shared]() {
+    std::thread send_thread([&, send_metrics, shared, ring_status]() {
         if (send_core >= 0) {
             cpu_set_t cs;
             CPU_ZERO(&cs);
@@ -158,6 +168,7 @@ int main(int argc, char* argv[])
 
         while (!io_shutdown_done) {
             if (meta) meta->send_heartbeat++;
+            if (ring_status) ring_status->head = ring.head();
 
             uint8_t hdr[48];
             if (ring.pop(hdr, 48) == 0) {
@@ -240,6 +251,8 @@ int main(int argc, char* argv[])
     if (zc_ok) io_uring_queue_exit(&send_uring);
     munmap(shared, sizeof(SharedMetrics));
     shm_unlink(shm_path);
+    munmap(ring_status, sizeof(RingStatus));
+    shm_unlink("/nebulaX_ring");
     munmap(book_base, BOOK_SIZE);
     shm_unlink("/nebulaX_book");
     close(wake_fd);

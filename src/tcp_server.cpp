@@ -14,8 +14,10 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
                      SPSCByteRing<RING_SIZE>& resp_ring,
                      int wake_fd,
                      IOCounters* metrics,
+                     RingStatus* ring_status,
                      uint64_t* io_heartbeat, uint64_t* send_heartbeat)
     : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd), metrics_(metrics)
+    , ring_status_(ring_status)
     , io_heartbeat_(io_heartbeat), send_heartbeat_(send_heartbeat)
 {
     // ── create server socket (non-blocking) ──
@@ -56,7 +58,6 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
     write(STDOUT_FILENO, "NebulaX online\n", 15);
     LOG_INFO("listening on port %d", port_);
 
-    if (metrics_) metrics_->ring_capacity = RING_SIZE;
 }
 
 TcpServer::~TcpServer()
@@ -136,7 +137,7 @@ void TcpServer::start()
         );
 
         drainPendingClose();
-        if (metrics_) metrics_->ring_free_space = ring_.free_space();
+        if (ring_status_) ring_status_->tail = ring_.tail();
         logSummary();
     }
 

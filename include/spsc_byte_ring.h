@@ -108,6 +108,9 @@ public:
     uint8_t* raw_buffer() { return buf_; }
     size_t   raw_size() const { return N; }
     struct iovec raw_iovec() { return { buf_, N }; }
+    // 外部只读：暴露读写位置（供监控端 mmap 后直接读）
+    size_t tail() const { return tail_.load(std::memory_order_relaxed); }
+    size_t head() const { return head_.load(std::memory_order_relaxed); }
 
 private:
     alignas(64) std::atomic<size_t> tail_{0};

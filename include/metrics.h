@@ -13,8 +13,8 @@ struct IOCounters
     uint64_t errors          = 0;
     uint64_t order_pool_used      = 0;
     uint64_t order_pool_capacity  = 0;  // 启动时设一次，不变
-    uint64_t ring_free_space      = 0;  // SPSC ring 空闲字节数
-    uint64_t ring_capacity        = 0;  // SPSC ring 总容量，启动时设一次
+    uint64_t _reserved_0          = 0;  // 预留，对齐到 10 字段
+    uint64_t _reserved_1          = 0;
 };
 
 // Send 线程计数器（Send 线程写，IO 线程不碰）
