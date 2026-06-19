@@ -168,6 +168,7 @@ int main(int argc, char* argv[])
 
         while (!io_shutdown_done) {
             if (meta) meta->send_heartbeat++;
+            if (send_metrics) send_metrics->send_tick_counter++;
             if (ring_status) ring_status->head = ring.head();
 
             uint8_t hdr[48];

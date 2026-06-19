@@ -5,8 +5,8 @@
 SharedMetrics 布局（16 × uint64_t = 128 bytes）:
   [0] io_thread_pid
   [1] send_thread_pid
-  [2-11]  IOCounters (10)
-  [12-15] SendCounters (4)
+  [2-10]  IOCounters (9)
+  [11-15] SendCounters (5)
 """
 
 import mmap
@@ -19,10 +19,11 @@ SHM_PATH = "/dev/shm/nebulaX_metrics"
 IO_FIELDS = [
     "recv_frames", "new_orders", "cancels", "book_queries",
     "trades", "errors", "order_pool_used", "order_pool_capacity",
-    "ring_free_space", "ring_capacity",
+    "tick_counter",
 ]
 SEND_FIELDS = [
     "send_batches", "send_bytes", "send_zc_ok", "send_zc_fail",
+    "send_tick_counter",
 ]
 
 def fmt_bytes(n):
@@ -46,8 +47,8 @@ def read_metrics():
 
     data = struct.unpack_from("<16Q", mm, 0)
     io_pid, send_tid = data[0], data[1]
-    io_data = data[2:12]
-    send_data = data[12:16]
+    io_data = data[2:11]
+    send_data = data[11:16]
 
     print(f"── IO Thread (pid={io_pid}) ──")
     for i, name in enumerate(IO_FIELDS):

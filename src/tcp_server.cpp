@@ -89,7 +89,8 @@ void TcpServer::start()
     poller_.submit_accept(server_fd_);
 
     while (!ShutdownGuard::isStopping()) {
-        if (io_heartbeat_) (*io_heartbeat_)++;
+        if (metrics_) metrics_->tick_counter++;
+    if (io_heartbeat_) (*io_heartbeat_)++;
         int ret = poller_.submit_and_wait_timeout(server_fd_, 500);
         if (ret < 0) {
             if (errno == EINTR) continue;
