@@ -55,6 +55,8 @@ TcpServer::TcpServer(int port, MatchingEngine& engine,
 
     write(STDOUT_FILENO, "NebulaX online\n", 15);
     LOG_INFO("listening on port %d", port_);
+
+    if (metrics_) metrics_->ring_capacity = RING_SIZE;
 }
 
 TcpServer::~TcpServer()
@@ -134,6 +136,7 @@ void TcpServer::start()
         );
 
         drainPendingClose();
+        if (metrics_) metrics_->ring_free_space = ring_.free_space();
         logSummary();
     }
 

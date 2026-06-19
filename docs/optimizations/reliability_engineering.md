@@ -139,7 +139,7 @@ Python 压测 4 连接并发：
 | WAL 文件 | 512MB | /tmp/nebulaX_wal.dat，mmap 环形 |
 | 共享内存订单池 | 256MB | 4M × 64B Order 结构 |
 | 共享内存 TradePool | 84MB | 1M × ~84B TradeEntry |
-| metrics 共享内存 | 112B | IOCounters + SendCounters |
+| metrics 共享内存 | 128B | IOCounters + SendCounters + ring 利用率 |
 
 ---
 

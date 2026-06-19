@@ -2,11 +2,11 @@
 """NebulaX 实时性能计数器读取工具。
 用法: python3 scripts/read_metrics.py
 
-SharedMetrics 布局（14 × uint64_t = 112 bytes）:
+SharedMetrics 布局（16 × uint64_t = 128 bytes）:
   [0] io_thread_pid
   [1] send_thread_pid
-  [2-9]   IOCounters (8)
-  [10-13] SendCounters (4)
+  [2-11]  IOCounters (10)
+  [12-15] SendCounters (4)
 """
 
 import mmap
@@ -19,6 +19,7 @@ SHM_PATH = "/dev/shm/nebulaX_metrics"
 IO_FIELDS = [
     "recv_frames", "new_orders", "cancels", "book_queries",
     "trades", "errors", "order_pool_used", "order_pool_capacity",
+    "ring_free_space", "ring_capacity",
 ]
 SEND_FIELDS = [
     "send_batches", "send_bytes", "send_zc_ok", "send_zc_fail",
@@ -39,14 +40,14 @@ def read_metrics():
 
     fd = os.open(SHM_PATH, os.O_RDONLY)
     try:
-        mm = mmap.mmap(fd, 112, mmap.MAP_SHARED, mmap.PROT_READ)
+        mm = mmap.mmap(fd, 128, mmap.MAP_SHARED, mmap.PROT_READ)
     finally:
         os.close(fd)
 
-    data = struct.unpack_from("<14Q", mm, 0)
+    data = struct.unpack_from("<16Q", mm, 0)
     io_pid, send_tid = data[0], data[1]
-    io_data = data[2:10]
-    send_data = data[10:14]
+    io_data = data[2:12]
+    send_data = data[12:16]
 
     print(f"── IO Thread (pid={io_pid}) ──")
     for i, name in enumerate(IO_FIELDS):

@@ -44,9 +44,9 @@ def send_orders(count=100, port=2250):
 
 def read_metrics():
     fd = os.open(METRICS_SHM, os.O_RDONLY)
-    mm = mmap.mmap(fd, 112, mmap.MAP_SHARED, mmap.PROT_READ)
+    mm = mmap.mmap(fd, 128, mmap.MAP_SHARED, mmap.PROT_READ)
     os.close(fd)
-    d = struct.unpack_from("<14Q", mm, 0)
+    d = struct.unpack_from("<16Q", mm, 0)
     mm.close()
     return d  # d[3]=new_orders, d[8]=order_pool_used
 
