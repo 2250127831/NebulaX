@@ -18,7 +18,7 @@ Client → [TCP] → io_uring recv
 
 ### Matching Engine
 
-Price-Time Priority（价格优先 + 时间优先 FIFO），支持部分成交、撤单。`std::map<price, PriceLevel>` 买卖盘 + OrderMap（哈希链 > 8 溢出 std::map）O(1) 撤单索引。
+Price-Time Priority（价格优先 + 时间优先 FIFO），支持部分成交、撤单。`std::map<price, PriceLevel>` 买卖盘 + OrderMap（链长达到 8 后整体转入 std::map）O(1) 撤单索引。
 
 ### 协议
 
@@ -44,7 +44,7 @@ Price-Time Priority（价格优先 + 时间优先 FIFO），支持部分成交�
 | P99 | 51ms | 6µs | 53ms |
 | P999 | 56ms | 7µs | 58ms |
 
-¹ 2026-06-17 沪深 20 只股票逐笔成交（69,633 条 → 80,217 笔订单含 ~20% 撤单），Python 批量回放。数据文件 `data/l2_replay_20260617.csv`。
+L2 数据：2026-06-17 沪深 20 只股票逐笔成交（69,633 条 → 80,217 笔订单含 ~20% 撤单），Python 批量回放。数据文件 `data/l2_replay_20260617.csv`。
 
 ---
 
@@ -56,7 +56,7 @@ NebulaX/
 │   ├── matching_engine.h          撮合引擎
 │   ├── order_book.h               买卖盘 + OrderMap 索引
 │   ├── order_pool.h               内存池（4M 定长槽，支持 mmap 共享存储）
-│   ├── order_map.h                哈希链 > 8 溢出到 std::map
+│   ├── order_map.h                链长达到 8 后整体转入 std::map
 │   ├── protocol.h                 二进制协议
 │   ├── tcp_server.h               io_uring 服务端
 │   ├── io_uring_poller.h          io_uring 封装（固定缓冲区 + 超时处理）
@@ -104,7 +104,7 @@ NebulaX/
 
 - **SPSC 字节环形缓冲区**：单生产者单消费者，无锁读写，read_acquire/read_release 零拷贝
 - **MPSC 环形缓冲区**（日志）：多生产者 CAS 占槽 + seq 两阶段提交
-- **OrderMap**：哈希桶链长 > 8 自动溢出到 std::map 防退化
+- **OrderMap**：bucket 链长达到 8 后整体转入 std::map 防退化
 - **OrderPool**：4M 定长槽，O(1) allocate/deallocate，无 malloc
 
 ### 可观测性
