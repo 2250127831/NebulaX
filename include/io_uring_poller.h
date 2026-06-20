@@ -2,9 +2,16 @@
 
 #include <liburing.h>
 #include <sys/socket.h>
+#include <ctime>
 #include <netinet/in.h>
 #include <functional>
 #include <cstdint>
+
+// IORING_RECVSEND_POLL_FIRST: 让 io_uring recv 先 poll 而非立即回 -EAGAIN
+// 内核 5.19+，系统头文件可能未导出，手动保证
+#ifndef IORING_RECVSEND_POLL_FIRST
+#define IORING_RECVSEND_POLL_FIRST (1U << 0)
+#endif
 
 // io_uring 事件轮询器，替代 epoll_wait + recv 循环。
 // 只负责 recv 路径——send 路径（SPSC ring + eventfd）完全不碰。
@@ -66,13 +73,14 @@ public:
 
     // ── SQE 提交 ──
 
-    // 使用固定缓冲区的 recv
+    // recv（带 POLL_FIRST）：无数据时内核 poll 等待，不立即回 -EAGAIN
     bool submit_recv(int fd, uint32_t buf_idx)
     {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) return false;
         io_uring_prep_recv(sqe, fd, bufs_[buf_idx], BUF_SIZE, 0);
         sqe->buf_index = buf_idx;
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(fd)));
         return true;
     }
@@ -95,6 +103,22 @@ public:
         return io_uring_submit_and_wait(&ring_, 1);
     }
 
+    // 带超时的 submit_and_wait（用于优雅关闭时不被永久阻塞）
+    // timeout_ms 后即使无 CQE 也会返回
+    // server_fd: 用来设置 timeout SQE 的 user_data，避免 CQE 残留值被误判为 recv
+    int submit_and_wait_timeout(int server_fd, uint64_t timeout_ms)
+    {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) return submit_and_wait();
+        struct timespec ts;
+        ts.tv_sec  = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+        io_uring_prep_timeout(sqe, (struct __kernel_timespec*)&ts, 1, 0);
+        // 必须设 user_data：SQE 回收后残留旧 fd 值，timeout CQE 会被误当成 recv 结果
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(server_fd)));
+        return io_uring_submit_and_wait(&ring_, 1);
+    }
+
     void process_cqes(int server_fd,
                       const std::function<void(int)>& on_accept,
                       const std::function<void(int, int)>& on_recv)
@@ -107,7 +131,8 @@ public:
             int res = cqe->res;
 
             if (fd == server_fd) {
-                if (res >= 0)
+                // accept 永远返回 > 0 的 fd；res=0 表示 timeout CQE，跳过
+                if (res > 0)
                     on_accept(res);
             } else {
                 on_recv(fd, res);

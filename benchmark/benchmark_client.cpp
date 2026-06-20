@@ -13,6 +13,7 @@
 #include <random>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -137,41 +138,16 @@ struct WorkerResult {
 };
 
 static WorkerResult runWorker(const char* ip, int port,
-                               const Cmd* seq, int count,
-                               bool do_prefill) {
+                               const Cmd* seq, int count) {
     WorkerResult wr = {};
 
     Client c(ip, port);
     if (!c.ok()) { wr.count = 0; wr.qps = 0; return wr; }
 
-    // pre-fill: 200 resting orders
-    if (do_prefill) {
-        for (int i = 0; i < 100; ++i) {
-            BinaryCommand cmd{};
-            cmd.type = CMD_NEW;
-            cmd.side = SIDE_BUY;
-            cmd.price = 9000 + i % 100;
-            cmd.quantity = 10;
-            cmd.user_id = BUY_UID;
-            c.sendCommand(cmd);
-            BinaryResponse rsp;
-            c.recvResponse(rsp);
-        }
-        for (int i = 0; i < 100; ++i) {
-            BinaryCommand cmd{};
-            cmd.type = CMD_NEW;
-            cmd.side = SIDE_SELL;
-            cmd.price = 25000 + i % 100;
-            cmd.quantity = 10;
-            cmd.user_id = SELL_UID;
-            c.sendCommand(cmd);
-            BinaryResponse rsp;
-            c.recvResponse(rsp);
-        }
-    }
-
-    // pipeline send/recv
+    // pipeline send/recv — 共享 order_id 队列供 CANCEL 使用
     WorkerRing ring(count);
+    std::vector<uint64_t> open_oids;
+    std::mutex oid_mtx;
     auto start_time = steady_clock::now();
 
     std::thread sender([&]() {
@@ -198,6 +174,22 @@ static WorkerResult runWorker(const char* ip, int port,
                 bc->price = seq[i].price;
                 bc->quantity = seq[i].qty;
                 bc->user_id = (seq[i].side == 0) ? BUY_UID : SELL_UID;
+            } else if (seq[i].type == 1) { // CANCEL
+                uint64_t oid = 0;
+                {
+                    std::lock_guard<std::mutex> lk(oid_mtx);
+                    if (!open_oids.empty()) {
+                        oid = open_oids.back();
+                        open_oids.pop_back();
+                    }
+                }
+                if (oid) {
+                    bc->type = CMD_CANCEL;
+                    bc->order_id = oid;
+                    bc->user_id = (oid % 2 == 0) ? BUY_UID : SELL_UID;
+                } else {
+                    bc->type = CMD_BOOK;
+                }
             } else {
                 bc->type = CMD_BOOK;
             }
@@ -212,6 +204,10 @@ static WorkerResult runWorker(const char* ip, int port,
         BinaryResponse rsp;
         while (received < (uint64_t)count) {
             c.recvResponse(rsp);
+            if (rsp.type == RSP_OK || rsp.type == RSP_FILLED) {
+                std::lock_guard<std::mutex> lk(oid_mtx);
+                open_oids.push_back(rsp.data.ack.order_id);
+            }
             auto idx = ring.recv_idx.fetch_add(1, std::memory_order_relaxed);
             ring.ts_recv[idx] = __rdtsc();
             received++;
@@ -255,7 +251,7 @@ int main(int argc, char* argv[]) {
     tsc_ns();  // prime calibration
 
     const int N_RUNS   = 3;
-    const int64_t TOTAL_CMDS = pipeline ? 50000000 : 1000000;
+    const int64_t TOTAL_CMDS = 10000000;
     const int N_NEW    = TOTAL_CMDS * 50 / 100;
     const int N_CANCEL = TOTAL_CMDS * 25 / 100;
     const int N_BOOK   = TOTAL_CMDS * 25 / 100;
@@ -283,11 +279,10 @@ int main(int argc, char* argv[]) {
     for (int run = 0; run < N_RUNS; ++run) {
         if (pipeline) {
             // ── pipeline mode: N_CONN 连接并行 ──
-            // 预热
+            // 预热（单连接顺序收发）
             {
                 Client wc(ip.c_str(), port);
                 if (!wc.ok()) { fprintf(stderr, "warmup connect failed\n"); continue; }
-                // pre-fill 200
                 for (int i = 0; i < 100; ++i) {
                     BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_BUY;
                     cmd.price = 9000 + i % 100; cmd.quantity = 10; cmd.user_id = BUY_UID;
@@ -300,7 +295,6 @@ int main(int argc, char* argv[]) {
                     wc.sendCommand(cmd);
                     BinaryResponse rsp; wc.recvResponse(rsp);
                 }
-                // warmup commands
                 for (int i = 0; i < WARMUP_CMDS; ++i) {
                     auto& c = seq[i % TOTAL_CMDS];
                     BinaryCommand bc{};
@@ -319,24 +313,40 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // prefill 200 笔 resting orders（提前做，不与并发流量争 IO 线程）
+            {
+                Client pc(ip.c_str(), port);
+                if (pc.ok()) {
+                    for (int i = 0; i < 100; ++i) {
+                        BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_BUY;
+                        cmd.price = 9000 + i % 100; cmd.quantity = 10; cmd.user_id = BUY_UID;
+                        pc.sendCommand(cmd);
+                        BinaryResponse rsp; pc.recvResponse(rsp);
+                    }
+                    for (int i = 0; i < 100; ++i) {
+                        BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_SELL;
+                        cmd.price = 25000 + i % 100; cmd.quantity = 10; cmd.user_id = SELL_UID;
+                        pc.sendCommand(cmd);
+                        BinaryResponse rsp; pc.recvResponse(rsp);
+                    }
+                }
+            }
+
             // 多连接 pipeline 压测
             std::vector<WorkerResult> wrs(N_CONN);
             std::vector<std::thread> threads;
             int chunk = TOTAL_CMDS / N_CONN;
 
-            // 第一个 worker 负责 pre-fill，后续 worker 不 pre-fill
             for (int i = 0; i < N_CONN; ++i) {
                 int start = i * chunk;
                 int cnt = (i == N_CONN - 1) ? TOTAL_CMDS - start : chunk;
                 threads.emplace_back([&, i, start, cnt]() {
-                    wrs[i] = runWorker(ip.c_str(), port,
-                                       &seq[start], cnt,
-                                       i == 0);  // only first does prefill
+                    wrs[i] = runWorker(ip.c_str(), port, &seq[start], cnt);
                 });
             }
             for (auto& t : threads) t.join();
 
-            // 汇总（QPS = 总命令数 / 最长耗时，避免多 worker 求和虚高）
+            // 汇总（QPS = 总命令数 / 最长耗时）
             std::vector<double> all_lat;
             int64_t total_cmds = 0;
             int64_t max_wall_us = 0;
@@ -359,11 +369,10 @@ int main(int argc, char* argv[]) {
             runs.push_back({avg, p50, p99, p999, true_qps, total_cmds});
 
         } else {
-            // ── pingpong mode: 单连接 RTT（保持不变） ──
+            // ── pingpong mode: 单连接 RTT ──
             Client c(ip.c_str(), port);
             if (!c.ok()) { fprintf(stderr, "connect failed\n"); continue; }
 
-            // pre-fill
             for (int i = 0; i < 100; ++i) {
                 BinaryCommand cmd{};
                 cmd.type = CMD_NEW; cmd.side = SIDE_BUY;
@@ -449,13 +458,13 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < (int)runs.size(); ++i) {
         auto& r = runs[i];
         printf("| %3d | %6d | %5.0f | %5.0f | %5.0f | %5.0f | %8.0f |\n",
-               i + 1, r.total, r.avg_us, r.p50, r.p99, r.p999, r.qps);
+               i + 1, (int)r.total, r.avg_us, r.p50, r.p99, r.p999, r.qps);
         sum_qps += r.qps; sum_avg += r.avg_us;
         sum_p50 += r.p50; sum_p99 += r.p99; sum_p999 += r.p999;
     }
     int n = (int)runs.size();
     printf("| avg | %6d | %5.0f | %5.0f | %5.0f | %5.0f | %8.0f |\n",
-           n ? runs[0].total : 0, sum_avg / n, sum_p50 / n,
+           n ? (int)runs[0].total : 0, sum_avg / n, sum_p50 / n,
            sum_p99 / n, sum_p999 / n, sum_qps / n);
     printf("\nRuns: %d/%d successful (%s)\n", (int)runs.size(), N_RUNS,
            pipeline ? "pipeline" : "pingpong");

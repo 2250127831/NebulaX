@@ -2,14 +2,22 @@
 
 #include <cstring>
 #include <vector>
+#include <list>
 #include <unordered_map>
+#include <atomic>
 
 #include "spsc_byte_ring.h"
 #include "io_uring_poller.h"
 #include "matching_engine.h"
 #include "protocol.h"
+#include "metrics.h"
 
-constexpr size_t RING_SIZE = 1048576;  // 1 MB
+// SPSC ring 状态快照（独立 shm），供监控端 mmap 直接读取
+struct RingStatus {
+    uint64_t tail;       // IO 线程写
+    uint64_t head;       // Send 线程写
+    uint64_t capacity;   // RING_SIZE
+};
 
 // 连接上下文：读缓冲（仅 IO+Matching 线程使用）
 struct ConnContext
@@ -19,6 +27,9 @@ struct ConnContext
     uint32_t buf_idx = UINT32_MAX;  // 固定缓冲区索引，用于 re-arm recv
     size_t pending = 0;
     size_t consumed = 0;
+
+    bool closing = false;                      // 正在关闭，不再提交 recv
+    std::atomic<bool> close_acked{false};      // Send 线程 close(fd) 后置 true
 
     void compact()
     {
@@ -37,7 +48,11 @@ public:
         int port,
         MatchingEngine& engine,
         SPSCByteRing<RING_SIZE>& resp_ring,
-        int wake_fd
+        int wake_fd,
+        IOCounters* metrics,
+        RingStatus* ring_status = nullptr,
+        uint64_t* io_heartbeat = nullptr,
+        uint64_t* send_heartbeat = nullptr
     );
 
     ~TcpServer();
@@ -53,6 +68,8 @@ private:
     void onRecv(ConnContext* conn, int bytes_read);
 
     void closeConnection(ConnContext* conn);
+    void drainPendingClose();
+    void logSummary();
     void pushResponses(int fd, const std::vector<BinaryResponse>& buf);
     void notifySendThread();
 
@@ -70,4 +87,10 @@ private:
 
     IoUringPoller poller_;
     std::unordered_map<int, ConnContext*> conns_;
+    std::list<ConnContext*> pending_closes_;  // 等待 Send 确认的关闭连接（尾插，老的在队首）
+    IOCounters* metrics_ = nullptr;     // 指向 shared.io
+    RingStatus* ring_status_ = nullptr;
+    uint64_t*   io_heartbeat_ = nullptr;
+    uint64_t*   send_heartbeat_ = nullptr;
+    uint64_t summary_last_orders_ = 0;
 };
