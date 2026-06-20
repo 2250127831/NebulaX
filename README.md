@@ -34,18 +34,18 @@ Price-Time Priority（价格优先 + 时间优先 FIFO），支持部分成交�
 
 ## 性能
 
-硬件：12th Gen Intel Core i9-12900HX / 24 核 / 31GB RAM / Ubuntu 22.04 / Linux 6.8.0<br>
-绑核：IO+Matching core 6、Send core 7、Client core 5（均为 P-core）<br>
-网络：127.0.0.1 loopback TCP
+**Pipeline / Ping-pong**（物理机, Phase 7）：12th Gen Intel Core i9-12900HX / 24 核 / 31GB RAM / Ubuntu 22.04 / Linux 6.8.0<br>
+**L2 真实行情**（VM, Phase 9）：Ubuntu 22.04 VM / 8 vCPU / 8GB RAM / Linux 6.8.0<br>
+网络：127.0.0.1 loopback TCP，IO+Matching core 6、Send core 7、Client core 5（P-core）
 
-| 指标 | Pipeline (50M) | Ping-pong (1M) | L2 真实行情回放 |
+| 指标 | Pipeline (50M) 物理机 | Ping-pong (1M) 物理机 | L2 真实行情回放¹ VM |
 |:----|:-------------:|:--------------:|:--------------:|
-| QPS | **13.9M** | 197K | **5.9M** |
-| P50 | 40ms | 5µs | — |
-| P99 | 51ms | 6µs | — |
-| P999 | 56ms | 7µs | — |
+| QPS | **13.9M** | 197K | 125K |
+| P50 | 40ms | 5µs | 36µs |
+| P99 | 51ms | 6µs | 110µs |
+| P999 | 56ms | 7µs | 200µs |
 
-L2 真实行情：2026-06-17 沪深 20 只股票逐笔成交（69,633 条），生成 80,217 笔订单含 ~20% 撤单。数据见 `data/l2_replay_20260617.csv`。
+¹ L2 真实行情数据（2026-06-17 沪深 20 只股票逐笔成交，69,633 条 → 80,217 笔订单，含 ~20% 撤单）在 **VM 环境**（Ubuntu 22.04 VM, 8 vCPU, 8GB RAM）上测得。Pipeline/Synthetic 数据在 **物理机** 不同阶段测得（Phase 7, i9-12900HX）。数据文件见 `data/l2_replay_20260617.csv`。
 
 ---
 
