@@ -27,20 +27,40 @@ def stop_server(pid, sig=signal.SIGTERM):
         os.waitpid(pid, 0)
     except: pass
 
+def itch_add(loc, order_ref, side, price_cents, shares):
+    """ITCH 5.0 A 消息（Add Order, body 36B）+ 2B 长度前缀。"""
+    body = struct.pack(">B", 0x41)            # 'A'
+    body += struct.pack(">H", loc)            # locate
+    body += struct.pack(">H", 0)              # track
+    body += b"\x00" * 6                       # timestamp
+    body += struct.pack(">Q", order_ref)      # order_ref
+    body += b"B" if side == 1 else b"S"       # buy/sell
+    body += struct.pack(">I", shares)         # shares
+    body += b"TEST1   "                       # stock 8B
+    body += struct.pack(">I", price_cents * 100)  # price (分×100)
+    return struct.pack(">H", len(body)) + body
+
 def send_orders(count=100, port=2250):
     s = socket.socket(); s.settimeout(10)
     s.connect(("127.0.0.1", port))
-    buf = bytearray()
+    # 按 ITCH 帧发送 A 消息（顺序发，每条等响应——服务端攒批推送）
     for i in range(count):
-        buf.extend(struct.pack("<BBxxII4xQQ", 1, 1, 100 + i%990, 10, i%65535+1, 0))
-    s.sendall(bytes(buf))
-    total = count * 48
-    while total > 0:
-        chunk = s.recv(min(total, 65536))
+        s.sendall(itch_add(1, 1000 + i, 1, 100 + i % 990, 10))
+    # 收响应：每条订单至少一个非 TRADE 最终帧（可能多个 RSP_TRADE + RSP_OK）
+    received = 0
+    while received < count:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            break
         if not chunk: break
-        total -= len(chunk)
+        # 48B 一帧，数非 TRADE 帧数（一个订单一个最终状态帧）
+        nframes = len(chunk) // 48
+        for f in range(nframes):
+            if chunk[f*48] != 0x81:  # RSP_TRADE=0x81 跳过
+                received += 1
     s.close()
-    return total == 0
+    return received == count
 
 def read_metrics():
     fd = os.open(METRICS_SHM, os.O_RDONLY)
