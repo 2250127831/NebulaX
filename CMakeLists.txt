@@ -39,5 +39,6 @@ else()
 endif()
 
 # ── 单元测试 ──
-add_executable(test_unit test/test_unit.cpp src/order_book.cpp src/logger.cpp)
+add_executable(test_unit test/test_unit.cpp src/order_book.cpp src/matching_engine.cpp
+    src/itch_parser.cpp src/protocol.cpp src/wal.cpp src/logger.cpp)
 target_link_libraries(test_unit PRIVATE Threads::Threads rt)
