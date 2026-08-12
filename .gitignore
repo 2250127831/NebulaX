@@ -50,3 +50,6 @@ Thumbs.db
 # Test binaries
 test/test_correctness
 test/test_correctness_asan
+
+# 大数据样本（从 NebulaX-Trader test_data 拷贝）
+data/itch_sample.bin
