@@ -1,71 +1,46 @@
-// NebulaX benchmark client — pipeline / pingpong
-// Usage: ./benchmark_client <server_ip> [port] [mode]
-//   mode: -p (pipeline, default), -r (pingpong rtt)
-// Pipeline 默认多连接（N_CONN=4），pingpong 始终单连接
+// NebulaX ITCH 回放客户端（迁移自 NebulaX-Trader benchmark/main.cpp）
+// 用法: ./benchmark_client <itch_file> [port]
+//
+// 只做正确性回放：读 ITCH 二进制文件 → 按 2B 长度前缀切消息 → 过滤出订单消息
+// (A/F/D/X/U) → TCP 发送给撮合引擎 → 收响应 → 统计完成率。
+// 成交消息(P/E/C)是撮合引擎的输出，不作为输入发送。
+//
+// 输出：发送订单数 / 收到确认数 / 成交回报数 / 完成率。
 
+#include "../include/itch_parser.h"
 #include "../include/protocol.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
-#include <algorithm>
-#include <random>
 #include <thread>
 #include <atomic>
-#include <mutex>
 #include <vector>
 #include <string>
 
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
-#include <x86intrin.h>
 
 using namespace std::chrono;
 
-const uint64_t BUY_UID  = 1001;
-const uint64_t SELL_UID = 1002;
-
-// ── constants ──
-constexpr int N_CONN       = 4;
-constexpr int WARMUP_CMDS  = 10000;
-constexpr int BATCH        = 128;
-
-// ── RDTSC calibration ──
-static double tsc_ns() {
-    static double ns = 0;
-    if (ns == 0) {
-        auto start = steady_clock::now();
-        auto tsc = __rdtsc();
-        while (steady_clock::now() - start < milliseconds(100));
-        auto end_tsc = __rdtsc();
-        auto end_t = steady_clock::now();
-        ns = (double)duration_cast<nanoseconds>(end_t - start).count() / (end_tsc - tsc);
-    }
-    return ns;
-}
-
-// ── TCP Client ──
+// ── 简易 TCP 客户端 ──
 class Client {
     int sock_ = -1;
     std::vector<char> read_buf_;
 
     void fillBuffer(size_t need) {
         while (read_buf_.size() < need) {
-            char raw[4096];
-            auto n = ::recv(sock_, raw, sizeof(raw), 0);
+            char raw[8192];
+            ssize_t n = ::recv(sock_, raw, sizeof(raw), 0);
             if (n <= 0) return;
             read_buf_.insert(read_buf_.end(), raw, raw + n);
         }
-    }
-
-    void readFrame(BinaryResponse& rsp) {
-        fillBuffer(sizeof(rsp));
-        memcpy(&rsp, read_buf_.data(), sizeof(rsp));
-        read_buf_.erase(read_buf_.begin(), read_buf_.begin() + sizeof(rsp));
     }
 
 public:
@@ -83,391 +58,122 @@ public:
     ~Client() { if (sock_ >= 0) close(sock_); }
     bool ok() const { return sock_ >= 0; }
 
-    void sendCommand(const BinaryCommand& cmd) {
-        ::send(sock_, &cmd, sizeof(cmd), 0);
-    }
-
-    void sendBatch(const void* data, size_t len) {
+    void sendFrame(const void* data, size_t len) {
         ::send(sock_, data, len, 0);
     }
 
-    void recvResponse(BinaryResponse& rsp) {
-        do { readFrame(rsp); } while (rsp.type == RSP_TRADE);
+    // 读下一帧（48B 响应）。返回 false = 连接关闭/错误。
+    bool recvFrame(BinaryResponse& rsp) {
+        fillBuffer(sizeof(rsp));
+        if (read_buf_.size() < sizeof(rsp)) return false;
+        memcpy(&rsp, read_buf_.data(), sizeof(rsp));
+        read_buf_.erase(read_buf_.begin(), read_buf_.begin() + sizeof(rsp));
+        return true;
+    }
+
+    // 读一条订单消息的完整响应：排干 RSP_TRADE，返回最终状态帧。
+    // returns: true=读到最终帧, false=连接关闭
+    bool recvFinal(BinaryResponse& final_rsp) {
+        while (true) {
+            BinaryResponse rsp;
+            if (!recvFrame(rsp)) return false;
+            if (rsp.type != RSP_TRADE) { final_rsp = rsp; return true; }
+        }
     }
 };
 
-// ── helpers ──
-struct Cmd {
-    int type;     // 0=NEW, 1=CANCEL, 2=BOOK
-    int side;     // 0=BUY, 1=SELL (NEW only)
-    uint32_t price;
-    uint32_t qty;
+// ── 统计 ──
+struct Stats {
+    uint64_t sent = 0;          // 发送订单消息数
+    uint64_t confirmed = 0;     // 收到最终状态帧数
+    uint64_t trades = 0;        // 成交回报数（TRADE 帧）
+    uint64_t errors = 0;        // RSP_ERROR 数
+    uint64_t rejected = 0;      // 引擎拒绝（无效 order_ref 等）
+    uint64_t err_not_found = 0;   // ORDER_NOT_FOUND
+    uint64_t err_invalid = 0;     // INVALID_PRICE_QTY_USER
 };
 
-struct PerCmdStats { double us; int type; };
-struct RunStats {
-    double avg_us, p50, p99, p999, qps;
-    int64_t total;
-};
-
-static double pct(std::vector<double>& v, double p) {
-    if (v.empty()) return 0;
-    return v[(int)(p * v.size())];
-}
-
-// ── per-worker ring buffer for RDTSC timing ──
-struct WorkerRing {
-    uint64_t* ts_send;
-    uint64_t* ts_recv;
-    std::atomic<uint64_t> send_idx{0};
-    std::atomic<uint64_t> recv_idx{0};
-
-    explicit WorkerRing(size_t n) {
-        ts_send = new uint64_t[n];
-        ts_recv = new uint64_t[n];
-    }
-    ~WorkerRing() { delete[] ts_send; delete[] ts_recv; }
-};
-
-// ── worker: 一条连接上的 pipeline 收发 ──
-struct WorkerResult {
-    std::vector<double> lat_us;
-    double qps;
-    int64_t count;
-    int64_t wall_us;
-};
-
-static WorkerResult runWorker(const char* ip, int port,
-                               const Cmd* seq, int count) {
-    WorkerResult wr = {};
-
-    Client c(ip, port);
-    if (!c.ok()) { wr.count = 0; wr.qps = 0; return wr; }
-
-    // pipeline send/recv — 共享 order_id 队列供 CANCEL 使用
-    WorkerRing ring(count);
-    std::vector<uint64_t> open_oids;
-    std::mutex oid_mtx;
-    auto start_time = steady_clock::now();
-
-    std::thread sender([&]() {
-        char batch_buf[BATCH * sizeof(BinaryCommand)];
-        int batch_count = 0;
-
-        auto flush = [&]() {
-            if (batch_count > 0) {
-                c.sendBatch(batch_buf, batch_count * sizeof(BinaryCommand));
-                batch_count = 0;
-            }
-        };
-
-        for (int i = 0; i < count; ++i) {
-            auto idx = ring.send_idx.fetch_add(1, std::memory_order_relaxed);
-            ring.ts_send[idx] = __rdtsc();
-
-            auto* bc = reinterpret_cast<BinaryCommand*>(
-                batch_buf + batch_count * sizeof(BinaryCommand));
-            memset(bc, 0, sizeof(BinaryCommand));
-            if (seq[i].type == 0) { // NEW
-                bc->type = CMD_NEW;
-                bc->side = (seq[i].side == 0) ? SIDE_BUY : SIDE_SELL;
-                bc->price = seq[i].price;
-                bc->quantity = seq[i].qty;
-                bc->user_id = (seq[i].side == 0) ? BUY_UID : SELL_UID;
-            } else if (seq[i].type == 1) { // CANCEL
-                uint64_t oid = 0;
-                {
-                    std::lock_guard<std::mutex> lk(oid_mtx);
-                    if (!open_oids.empty()) {
-                        oid = open_oids.back();
-                        open_oids.pop_back();
-                    }
-                }
-                if (oid) {
-                    bc->type = CMD_CANCEL;
-                    bc->order_id = oid;
-                    bc->user_id = (oid % 2 == 0) ? BUY_UID : SELL_UID;
-                } else {
-                    bc->type = CMD_BOOK;
-                }
-            } else {
-                bc->type = CMD_BOOK;
-            }
-            batch_count++;
-            if (batch_count >= BATCH) flush();
-        }
-        flush();
-    });
-
-    std::thread receiver([&]() {
-        uint64_t received = 0;
-        BinaryResponse rsp;
-        while (received < (uint64_t)count) {
-            c.recvResponse(rsp);
-            if (rsp.type == RSP_OK || rsp.type == RSP_FILLED) {
-                std::lock_guard<std::mutex> lk(oid_mtx);
-                open_oids.push_back(rsp.data.ack.order_id);
-            }
-            auto idx = ring.recv_idx.fetch_add(1, std::memory_order_relaxed);
-            ring.ts_recv[idx] = __rdtsc();
-            received++;
-        }
-    });
-
-    sender.join();
-    receiver.join();
-
-    auto wall_us = duration_cast<microseconds>(
-        steady_clock::now() - start_time).count();
-
-    wr.count = count;
-    wr.wall_us = wall_us;
-    wr.qps = count * 1'000'000.0 / wall_us;
-    wr.lat_us.resize(count);
-    double ns = tsc_ns();
-    for (int i = 0; i < count; i++)
-        wr.lat_us[i] = (ring.ts_recv[i] - ring.ts_send[i]) * ns / 1000.0;
-
-    return wr;
-}
-
-// ── main ──
 int main(int argc, char* argv[]) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(5, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <server_ip> [port] [mode]\n", argv[0]);
-        fprintf(stderr, "  mode: -p (pipeline, default), -r (pingpong rtt)\n");
+        fprintf(stderr, "Usage: %s <itch_file> [port]\n", argv[0]);
         return 1;
     }
-    std::string ip = argv[1];
+    const char* file = argv[1];
     int port = (argc >= 3) ? std::stoi(argv[2]) : 2250;
-    bool pipeline = true;
-    if (argc >= 4 && std::string(argv[3]) == "-r") pipeline = false;
 
-    tsc_ns();  // prime calibration
+    // ── mmap ITCH 文件 ──
+    int fd = open(file, O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+    off_t file_size = lseek(fd, 0, SEEK_END);
+    auto* buf = static_cast<uint8_t*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
+    close(fd);
+    if (buf == MAP_FAILED) { perror("mmap"); return 1; }
 
-    const int N_RUNS   = 3;
-    const int64_t TOTAL_CMDS = 10000000;
-    const int N_NEW    = TOTAL_CMDS * 50 / 100;
-    const int N_CANCEL = TOTAL_CMDS * 25 / 100;
-    const int N_BOOK   = TOTAL_CMDS * 25 / 100;
+    // ── 连接撮合引擎 ──
+    Client c("127.0.0.1", port);
+    if (!c.ok()) { fprintf(stderr, "connect failed\n"); return 1; }
 
-    std::mt19937 rng(42);
+    ItchParser parser;
+    Stats st;
 
-    std::vector<Cmd> seq(TOTAL_CMDS);
-    {
-        int idx = 0;
-        for (int i = 0; i < N_NEW;   ++i) seq[idx++] = {0, 0, 0, 0};
-        for (int i = 0; i < N_CANCEL;++i) seq[idx++] = {1, 0, 0, 0};
-        for (int i = 0; i < N_BOOK;  ++i) seq[idx++] = {2, 0, 0, 0};
-        std::shuffle(seq.begin(), seq.end(), rng);
-        for (auto& c : seq) {
-            if (c.type == 0) {
-                c.side  = rng() % 2;
-                c.price = 10000 + rng() % 5000;
-                c.qty   = (rng() % 10 + 1) * 10;
+    auto t0 = steady_clock::now();
+
+    // ── 顺序解析 ITCH，发送订单消息 ──
+    size_t pos = 0;
+    uint64_t extra = 0;
+    while (pos + 2 <= static_cast<size_t>(file_size)) {
+        // ITCH 5.0: 2 字节 big-endian 长度前缀 = 消息体长度（含 type）
+        uint16_t body_len = static_cast<uint16_t>((buf[pos] << 8) | buf[pos + 1]);
+        if (body_len < 1 || body_len > 4096) {
+            ++pos; ++extra;   // 损坏前缀，跳过对齐
+            continue;
+        }
+        size_t msg_len = 2 + static_cast<size_t>(body_len);
+        if (pos + msg_len > static_cast<size_t>(file_size)) break;
+
+        // 只发订单消息（A/F/D/X/U）。用 ItchParser 判断类型。
+        ItchEvent ev;
+        if (parser.feed(buf + pos + 2, body_len, ev)) {
+            // 发送完整帧（2B 前缀 + body）
+            c.sendFrame(buf + pos, msg_len);
+            st.sent++;
+
+            // 收该订单的最终状态帧
+            BinaryResponse final_rsp;
+            if (!c.recvFinal(final_rsp)) {
+                fprintf(stderr, "recv failed at order %lu\n", (unsigned long)st.sent);
+                break;
+            }
+            st.confirmed++;
+            if (final_rsp.type == RSP_TRADE) st.trades++;       // 不可能，但防御
+            else if (final_rsp.type == RSP_ERROR) {
+                st.errors++;
+                if (final_rsp.data.error.code == static_cast<uint16_t>(ErrorCode::ORDER_NOT_FOUND))
+                    st.err_not_found++;
+                else if (final_rsp.data.error.code == static_cast<uint16_t>(ErrorCode::INVALID_PRICE_QTY_USER))
+                    st.err_invalid++;
             }
         }
+        pos += msg_len;
     }
 
-    std::vector<RunStats> runs;
+    auto t1 = steady_clock::now();
+    double sec = duration_cast<duration<double>>(t1 - t0).count();
 
-    for (int run = 0; run < N_RUNS; ++run) {
-        if (pipeline) {
-            // ── pipeline mode: N_CONN 连接并行 ──
-            // 预热（单连接顺序收发）
-            {
-                Client wc(ip.c_str(), port);
-                if (!wc.ok()) { fprintf(stderr, "warmup connect failed\n"); continue; }
-                for (int i = 0; i < 100; ++i) {
-                    BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_BUY;
-                    cmd.price = 9000 + i % 100; cmd.quantity = 10; cmd.user_id = BUY_UID;
-                    wc.sendCommand(cmd);
-                    BinaryResponse rsp; wc.recvResponse(rsp);
-                }
-                for (int i = 0; i < 100; ++i) {
-                    BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_SELL;
-                    cmd.price = 25000 + i % 100; cmd.quantity = 10; cmd.user_id = SELL_UID;
-                    wc.sendCommand(cmd);
-                    BinaryResponse rsp; wc.recvResponse(rsp);
-                }
-                for (int i = 0; i < WARMUP_CMDS; ++i) {
-                    auto& c = seq[i % TOTAL_CMDS];
-                    BinaryCommand bc{};
-                    memset(&bc, 0, sizeof(bc));
-                    if (c.type == 0) {
-                        bc.type = CMD_NEW;
-                        bc.side = (c.side == 0) ? SIDE_BUY : SIDE_SELL;
-                        bc.price = c.price; bc.quantity = c.qty;
-                        bc.user_id = (c.side == 0) ? BUY_UID : SELL_UID;
-                    } else {
-                        bc.type = CMD_BOOK;
-                    }
-                    wc.sendCommand(bc);
-                    BinaryResponse rsp;
-                    wc.recvResponse(rsp);
-                }
-            }
+    // ── 汇总 ──
+    printf("\n===== ITCH 回放正确性验证 =====\n");
+    printf("  订单消息发送:  %lu\n", (unsigned long)st.sent);
+    printf("  收到确认:      %lu\n", (unsigned long)st.confirmed);
+    printf("  错误:          %lu (NOT_FOUND=%lu, INVALID=%lu)\n",
+           (unsigned long)st.errors, (unsigned long)st.err_not_found,
+           (unsigned long)st.err_invalid);
+    printf("  完成率:        %.1f%%\n", st.sent > 0 ? 100.0 * st.confirmed / st.sent : 0.0);
+    printf("  耗时:          %.3f s\n", sec);
+    printf("  QPS(参考):     %.0f\n", sec > 0 ? st.sent / sec : 0.0);
 
-            // prefill 200 笔 resting orders（提前做，不与并发流量争 IO 线程）
-            {
-                Client pc(ip.c_str(), port);
-                if (pc.ok()) {
-                    for (int i = 0; i < 100; ++i) {
-                        BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_BUY;
-                        cmd.price = 9000 + i % 100; cmd.quantity = 10; cmd.user_id = BUY_UID;
-                        pc.sendCommand(cmd);
-                        BinaryResponse rsp; pc.recvResponse(rsp);
-                    }
-                    for (int i = 0; i < 100; ++i) {
-                        BinaryCommand cmd{}; cmd.type = CMD_NEW; cmd.side = SIDE_SELL;
-                        cmd.price = 25000 + i % 100; cmd.quantity = 10; cmd.user_id = SELL_UID;
-                        pc.sendCommand(cmd);
-                        BinaryResponse rsp; pc.recvResponse(rsp);
-                    }
-                }
-            }
+    bool ok = (st.confirmed == st.sent && st.errors == 0);
+    printf("  %s\n", ok ? "✅ 全部订单确认，无错误" : "❌ 有未确认/错误");
 
-            // 多连接 pipeline 压测
-            std::vector<WorkerResult> wrs(N_CONN);
-            std::vector<std::thread> threads;
-            int chunk = TOTAL_CMDS / N_CONN;
-
-            for (int i = 0; i < N_CONN; ++i) {
-                int start = i * chunk;
-                int cnt = (i == N_CONN - 1) ? TOTAL_CMDS - start : chunk;
-                threads.emplace_back([&, i, start, cnt]() {
-                    wrs[i] = runWorker(ip.c_str(), port, &seq[start], cnt);
-                });
-            }
-            for (auto& t : threads) t.join();
-
-            // 汇总（QPS = 总命令数 / 最长耗时）
-            std::vector<double> all_lat;
-            int64_t total_cmds = 0;
-            int64_t max_wall_us = 0;
-            for (auto& wr : wrs) {
-                total_cmds += wr.count;
-                if (wr.wall_us > max_wall_us) max_wall_us = wr.wall_us;
-                all_lat.insert(all_lat.end(), wr.lat_us.begin(), wr.lat_us.end());
-            }
-            double true_qps = max_wall_us > 0 ? total_cmds * 1'000'000.0 / max_wall_us : 0;
-
-            std::sort(all_lat.begin(), all_lat.end());
-            double avg = 0;
-            for (auto v : all_lat) avg += v;
-            avg /= all_lat.size();
-            double p50 = pct(all_lat, 0.50), p99 = pct(all_lat, 0.99), p999 = pct(all_lat, 0.999);
-
-            printf("\nRun %d (pipeline, %d conns):\n", run + 1, N_CONN);
-            printf("  QPS=%8.0f  avg=%5.0fus  P50=%4.0fus  P99=%5.0fus  P999=%5.0fus\n",
-                   true_qps, avg, p50, p99, p999);
-            runs.push_back({avg, p50, p99, p999, true_qps, total_cmds});
-
-        } else {
-            // ── pingpong mode: 单连接 RTT ──
-            Client c(ip.c_str(), port);
-            if (!c.ok()) { fprintf(stderr, "connect failed\n"); continue; }
-
-            for (int i = 0; i < 100; ++i) {
-                BinaryCommand cmd{};
-                cmd.type = CMD_NEW; cmd.side = SIDE_BUY;
-                cmd.price = 9000 + i % 100; cmd.quantity = 10; cmd.user_id = BUY_UID;
-                c.sendCommand(cmd);
-                BinaryResponse rsp; c.recvResponse(rsp);
-            }
-            for (int i = 0; i < 100; ++i) {
-                BinaryCommand cmd{};
-                cmd.type = CMD_NEW; cmd.side = SIDE_SELL;
-                cmd.price = 25000 + i % 100; cmd.quantity = 10; cmd.user_id = SELL_UID;
-                c.sendCommand(cmd);
-                BinaryResponse rsp; c.recvResponse(rsp);
-            }
-
-            std::vector<PerCmdStats> cmd_stats;
-            cmd_stats.reserve(TOTAL_CMDS);
-            std::vector<uint64_t> open_oids;
-            open_oids.reserve(200);
-
-            for (auto& cmd : seq) {
-                auto start = high_resolution_clock::now();
-                bool sent = false;
-
-                if (cmd.type == 0) { // NEW
-                    BinaryCommand bc{};
-                    bc.type = CMD_NEW;
-                    bc.side = (cmd.side == 0) ? SIDE_BUY : SIDE_SELL;
-                    bc.price = cmd.price; bc.quantity = cmd.qty;
-                    bc.user_id = (cmd.side == 0) ? BUY_UID : SELL_UID;
-                    c.sendCommand(bc); sent = true;
-                    BinaryResponse rsp; c.recvResponse(rsp);
-                    if (rsp.type == RSP_OK || rsp.type == RSP_FILLED)
-                        open_oids.push_back(rsp.data.ack.order_id);
-
-                } else if (cmd.type == 1 && !open_oids.empty()) { // CANCEL
-                    uint64_t oid = open_oids.back(); open_oids.pop_back();
-                    BinaryCommand bc{};
-                    bc.type = CMD_CANCEL; bc.order_id = oid;
-                    bc.user_id = (oid % 2 == 0) ? BUY_UID : SELL_UID;
-                    c.sendCommand(bc); sent = true;
-                    BinaryResponse rsp; c.recvResponse(rsp);
-
-                } else { // BOOK
-                    BinaryCommand bc{};
-                    bc.type = CMD_BOOK;
-                    c.sendCommand(bc); sent = true;
-                    BinaryResponse rsp; c.recvResponse(rsp);
-                }
-
-                auto end = high_resolution_clock::now();
-                if (sent) {
-                    double us = duration_cast<microseconds>(end - start).count();
-                    cmd_stats.push_back({us, cmd.type});
-                }
-            }
-
-            std::vector<double> all_lat;
-            all_lat.reserve(cmd_stats.size());
-            for (auto& s : cmd_stats) all_lat.push_back(s.us);
-            std::sort(all_lat.begin(), all_lat.end());
-
-            double avg = 0;
-            for (auto v : all_lat) avg += v;
-            avg /= all_lat.size();
-            double p50 = pct(all_lat, 0.50), p99 = pct(all_lat, 0.99), p999 = pct(all_lat, 0.999);
-            double total_s = avg * all_lat.size() / 1'000'000.0;
-            double qps = all_lat.size() / total_s;
-
-            printf("\nRun %d (pingpong):\n", run + 1);
-            printf("  QPS=%8.0f  avg=%5.0fus  P50=%4.0fus  P99=%5.0fus  P999=%5.0fus\n",
-                   qps, avg, p50, p99, p999);
-            runs.push_back({avg, p50, p99, p999, qps, (int)all_lat.size()});
-        }
-    }
-
-    // ── summary ──
-    printf("\n\n");
-    printf("| Run | %6s | %5s | %5s | %5s | %5s | %8s |\n",
-           "cmds", "avg", "P50", "P99", "P999", "QPS");
-    printf("|-----|--------|-------|-------|-------|-------|----------|\n");
-    double sum_qps = 0, sum_avg = 0, sum_p50 = 0, sum_p99 = 0, sum_p999 = 0;
-    for (int i = 0; i < (int)runs.size(); ++i) {
-        auto& r = runs[i];
-        printf("| %3d | %6d | %5.0f | %5.0f | %5.0f | %5.0f | %8.0f |\n",
-               i + 1, (int)r.total, r.avg_us, r.p50, r.p99, r.p999, r.qps);
-        sum_qps += r.qps; sum_avg += r.avg_us;
-        sum_p50 += r.p50; sum_p99 += r.p99; sum_p999 += r.p999;
-    }
-    int n = (int)runs.size();
-    printf("| avg | %6d | %5.0f | %5.0f | %5.0f | %5.0f | %8.0f |\n",
-           n ? (int)runs[0].total : 0, sum_avg / n, sum_p50 / n,
-           sum_p99 / n, sum_p999 / n, sum_qps / n);
-    printf("\nRuns: %d/%d successful (%s)\n", (int)runs.size(), N_RUNS,
-           pipeline ? "pipeline" : "pingpong");
-
-    return 0;
+    munmap(buf, file_size);
+    return ok ? 0 : 1;
 }

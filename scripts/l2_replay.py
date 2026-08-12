@@ -15,7 +15,7 @@ L2 真实行情回放
 import socket, struct, time, sys, os, csv, random
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 2250
-CSV_PATH = "/tmp/l2_replay.csv"
+CSV_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "l2_replay.csv")
 BATCH = 4000
 
 def fetch():
@@ -71,38 +71,51 @@ def run():
             for o in orders: w.writerow(o)
         print(f"  完成 ({time.time()-t0:.1f}s)")
 
-    # 批量发送所有订单
+    # 批量发送所有订单（ITCH 格式：2B 长度前缀 + 消息体）
     with open(CSV_PATH) as f:
         lines = [l for l in f if not l.startswith("ms")][:100000]
 
-    buf = bytearray()
+    def u16be(x): return struct.pack(">H", x)
+    def u32be(x): return struct.pack(">I", x)
+    def u64be(x): return struct.pack(">Q", x)
+
+    frames = []
     for line in lines:
         p = line.strip().split(",")
+        loc = 1  # 单标的回放
         if p[1] == "NEW":
-            buf.extend(struct.pack("<BBxxII4xQQ", 1,
-                1 if p[2]=="1" else 2, int(p[3]), int(p[4]), int(p[5]), 0))
+            # A: Add Order (body 36B), 大端
+            body = b"A" + u16be(loc) + u16be(0) + b"\x00"*6 + u64be(int(p[5])) \
+                 + (b"B" if p[2] == "1" else b"S") + u32be(int(p[4])) \
+                 + b"\x00"*8 + u32be(int(p[3]) * 100)
         else:
-            buf.extend(struct.pack("<BBxxII4xQQ", 2, 0, 0, 0, int(p[5]), 0))
+            # D: Order Delete (body 19B)
+            body = b"D" + u16be(loc) + u16be(0) + b"\x00"*6 + u64be(int(p[5]))
+        frames.append(u16be(len(body)) + body)
 
-    total_orders = len(buf) // 32
-    print(f"回放: {total_orders} 笔 (分批{BATCH})")
+    total_orders = len(frames)
+    print(f"回放: {total_orders} 笔 ITCH (分批{BATCH})")
 
     s = socket.socket(); s.settimeout(120)
     s.connect(("127.0.0.1", PORT))
     t0 = time.time()
-    off = 0; ok = 0
-    while off < len(buf):
-        chunk = buf[off:off + BATCH * 32]
+    ok = 0
+    off = 0
+    while off < len(frames):
+        chunk = b"".join(frames[off:off + BATCH])
         try:
-            s.sendall(bytes(chunk))
-            need = len(chunk) // 32 * 48
-            while need > 0:
-                c = s.recv(min(need, 65536))
-                if not c: break
-                need -= len(c)
-            ok += len(chunk) // 32
-        except: break
-        off += len(chunk)
+            s.sendall(chunk)
+            # 逐条收响应：每条消息收到一个非 TRADE 的最终状态帧
+            for _ in range(min(BATCH, len(frames) - off)):
+                while True:
+                    c = s.recv(48)
+                    if not c: break
+                    if c[0] != 0x81: break   # 0x81=RSP_TRADE, 跳过, 读最终帧
+                ok += 1
+        except Exception as e:
+            print(f"  send error at {off}: {e}")
+            break
+        off += min(BATCH, len(frames) - off)
     t = time.time() - t0
     s.close()
     print(f"  成功: {ok}/{total_orders}  {t:.1f}s  {ok/t:.0f} QPS")

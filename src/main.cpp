@@ -1,6 +1,7 @@
 #include "matching_engine.h"
 #include "protocol.h"
 #include "tcp_server.h"
+#include "tcp_trade_server.h"
 #include "wal.h"
 #include "trade_pool.h"
 #include "crash_guard.h"
@@ -12,6 +13,8 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <mutex>
+#include <memory>
 
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -42,6 +45,7 @@ struct BookMeta {
 int main(int argc, char* argv[])
 {
     int port = 2250;
+    int trade_port = -1;   // <0 = 不启动交易接入
     int io_core   = -1;
     int send_core = -1;
 
@@ -50,6 +54,8 @@ int main(int argc, char* argv[])
             io_core = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--send-core") == 0 && i + 1 < argc)
             send_core = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--trade-port") == 0 && i + 1 < argc)
+            trade_port = std::atoi(argv[++i]);
         else
             port = std::atoi(argv[i]);
     }
@@ -139,6 +145,20 @@ int main(int argc, char* argv[])
     // ── 崩溃 handler（传入 WAL fd，崩溃时刷盘）──
     CrashGuard::install(wal.fd());
 
+    // ── 共享 ITCH 解析器（symbol→locate 映射，TcpServer + TcpTradeServer 共用）──
+    ItchParser itch_parser;
+
+    // ── 交易接入（TCP 全双工：Trader 下单 → 撮合 → 回 OUCH 回报）──
+    // 独立线程，engine 调用与 TcpServer（ITCH 输入）通过 engine_mtx 互斥。
+    std::mutex engine_mtx;
+    std::unique_ptr<TcpTradeServer> trade_server;
+    if (trade_port > 0) {
+        trade_server = std::make_unique<TcpTradeServer>(
+            static_cast<uint16_t>(trade_port), engine, engine_mtx);
+        trade_server->start();
+        LOG_INFO("trade server listening on port %d", trade_port);
+    }
+
     // ── IO+Matching 线程 ──
     std::thread io_thread([&]() {
         if (io_core >= 0) {
@@ -148,8 +168,9 @@ int main(int argc, char* argv[])
             pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
         }
         if (shared) shared->io_thread_pid = static_cast<uint64_t>(syscall(SYS_gettid));
-        TcpServer server(port, engine, ring, wake_fd, shared ? &shared->io : nullptr,
-                         ring_status, &meta->io_heartbeat, &meta->send_heartbeat);
+        TcpServer server(port, engine, ring, wake_fd, itch_parser,
+                         shared ? &shared->io : nullptr, ring_status,
+                         &meta->io_heartbeat, &meta->send_heartbeat);
         server.start();
     });
 
@@ -242,6 +263,9 @@ int main(int argc, char* argv[])
         write(wake_fd, &val, sizeof(val));
     }
     send_thread.join();
+
+    // 停止交易接入（若启用）
+    if (trade_server) trade_server->stop();
 
     LOG_INFO("saving snapshot...");
     engine.saveSnapshot("/tmp/nebulaX_snapshot.dat");

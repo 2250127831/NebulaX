@@ -13,10 +13,12 @@
 TcpServer::TcpServer(int port, MatchingEngine& engine,
                      SPSCByteRing<RING_SIZE>& resp_ring,
                      int wake_fd,
+                     ItchParser& parser,
                      IOCounters* metrics,
                      RingStatus* ring_status,
                      uint64_t* io_heartbeat, uint64_t* send_heartbeat)
-    : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd), metrics_(metrics)
+    : port_(port), engine_(engine), ring_(resp_ring), wake_fd_(wake_fd)
+    , itch_parser_(parser), metrics_(metrics)
     , ring_status_(ring_status)
     , io_heartbeat_(io_heartbeat), send_heartbeat_(send_heartbeat)
 {
@@ -146,10 +148,13 @@ void TcpServer::start()
     close(server_fd_);
     server_fd_ = -1;
 
-    // 第一遍：刷完所有连接上残余的未处理数据
+    // 第一遍：刷完所有连接上残余的未处理数据（解析累积缓冲剩余字节）
     for (auto& [fd, conn] : conns_) {
-        if (conn->pending > conn->consumed)
-            onRecv(conn, static_cast<int>(conn->pending - conn->consumed));
+        if (conn->pending > conn->consumed) {
+            std::vector<BinaryResponse> buf;
+            drainBuffered(conn, buf);
+            if (!buf.empty()) pushResponses(fd, buf);
+        }
     }
 
     // 第二遍：未关闭的推 RSP_CLOSE，已在 pending 中的跳过
@@ -220,29 +225,42 @@ void TcpServer::onRecv(ConnContext* conn, int bytes_read)
         return;
     }
 
-    conn->pending += bytes_read;
+    // io_uring 固定缓冲区每次 recv 从头写 → 先 append 到累积缓冲（半包跨 recv 保留）
+    conn->append_read(bytes_read);
 
     std::vector<BinaryResponse> buf;
-
-    // 解析所有完整命令，与 Phase 6 handleRead 的解析循环相同
-    while (conn->pending - conn->consumed >= sizeof(BinaryCommand)) {
-        BinaryCommand cmd;
-        memcpy(&cmd, conn->read_buf + conn->consumed, sizeof(cmd));
-        conn->consumed += sizeof(BinaryCommand);
-
-        if (!validateCommand(cmd)) {
-            auto& rsp = buf.emplace_back();
-            rsp.type = RSP_ERROR;
-            rsp.data.error.code = static_cast<uint16_t>(ErrorCode::INVALID_COMMAND_TYPE);
-        } else {
-            processRequest(cmd, buf);
-        }
-    }
-
-    conn->compact();
+    drainBuffered(conn, buf);
 
     if (!buf.empty())
         pushResponses(conn->fd, buf);
+}
+
+void TcpServer::drainBuffered(ConnContext* conn, std::vector<BinaryResponse>& out)
+{
+    // ── ITCH 帧解析：2 字节 big-endian 长度前缀 + 消息体（变长）──
+    // 从累积缓冲解析。与旧 32B 定长命令不同，需先读长度前缀，等消息体完整再解析。
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(conn->accum_buf.data()) + conn->consumed;
+    size_t avail = conn->pending - conn->consumed;
+
+    while (avail >= 2) {
+        // 长度前缀（big-endian）= 消息体字节数（不含前缀，含 type）
+        size_t body_len = (static_cast<size_t>(p[0]) << 8) | p[1];
+        if (body_len < 1 || body_len > 4096) {
+            // 非法长度 → 丢弃该字节继续对齐（防协议错位死循环）
+            conn->consumed += 1;
+            p += 1; avail -= 1;
+            continue;
+        }
+        size_t frame_len = 2 + body_len;
+        if (avail < frame_len) break;   // 半包，等更多数据
+
+        processItchMessage(p + 2, body_len, out);
+
+        conn->consumed += frame_len;
+        p += frame_len; avail -= frame_len;
+    }
+
+    conn->compact();
 }
 
 void TcpServer::closeConnection(ConnContext* conn)
@@ -364,20 +382,42 @@ void TcpServer::notifySendThread()
     write(wake_fd_, &val, sizeof(val));
 }
 
-void TcpServer::processRequest(const BinaryCommand& cmd, std::vector<BinaryResponse>& out)
+void TcpServer::processItchMessage(const uint8_t* msg, size_t len, std::vector<BinaryResponse>& out)
 {
-    switch (cmd.type) {
-        case CMD_NEW: {
-            Side side = (cmd.side == SIDE_BUY) ? Side::BUY : Side::SELL;
-            engine_.processNewOrder(side, cmd.price, cmd.quantity, cmd.user_id, out);
+    ItchEvent ev;
+    if (!itch_parser_.feed(msg, len, ev)) return;   // 非订单消息（P/E/C/R/S...）忽略
+
+    // ITCH 无账户归属字段：user_id 用 order_ref 派生（每单唯一 → 自成交防护自然不触发）
+    uint64_t user_id = ev.order_ref;
+
+    switch (ev.type) {
+        case ItchEvent::Type::ADD:
+            engine_.processAdd(ev.locate, ev.order_ref, ev.side,
+                               ev.price, ev.shares, user_id, out);
+            break;
+        case ItchEvent::Type::DELETE:
+            engine_.processCancel(ev.locate, ev.order_ref, user_id, out);
+            break;
+        case ItchEvent::Type::CANCEL:
+            engine_.processCancelShares(ev.locate, ev.order_ref, ev.shares, user_id, out);
+            break;
+        case ItchEvent::Type::REPLACE: {
+            // U 无方向：从旧单查 side（旧单不存在则拒绝，避免客户端无响应卡死）
+            OrderBook* book = engine_.book_for(ev.locate);
+            Order* old = book ? book->findOrder(ev.order_ref) : nullptr;
+            if (!old) {
+                auto& rsp = out.emplace_back();
+                rsp.type = RSP_ERROR;
+                rsp.data.error.code = static_cast<uint16_t>(ErrorCode::ORDER_NOT_FOUND);
+                return;
+            }
+            engine_.processReplace(ev.locate, ev.order_ref, ev.new_order_ref,
+                                   old->side, ev.price, ev.shares, user_id, out);
             break;
         }
-        case CMD_CANCEL:
-            engine_.processCancel(cmd.order_id, cmd.user_id, out);
-            break;
-        case CMD_BOOK: {
+        case ItchEvent::Type::BOOK: {
             auto& rsp = out.emplace_back();
-            engine_.getBook(rsp);
+            engine_.getBook(ev.locate, rsp);
             break;
         }
     }
