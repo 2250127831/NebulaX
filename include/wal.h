@@ -6,6 +6,7 @@
 struct WalEntry {
     uint8_t  type;
     uint8_t  side;
+    uint16_t locate;      // 订单所属股票（分簿恢复时路由到对应簿）
     uint32_t price;
     uint32_t quantity;
     uint64_t user_id;

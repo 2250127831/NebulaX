@@ -55,6 +55,16 @@ enum class ErrorCode : uint16_t
     ORDER_NOT_FOUND        = 3,
     INVALID_COMMAND_TYPE   = 4,
     POOL_FULL              = 5,
+    MKT_NO_LIQUIDITY       = 6,   // 市价单无对手盘（IOC 无法成交）
+    FOK_NO_FULL_FILL       = 7,   // FOK 单无法全成交（整个作废）
+};
+
+// ── 订单成交条件（Time in Force）──
+enum class OrderTif : uint8_t
+{
+    DAY = 0,   // 当日有效限价单，剩余挂簿（默认）
+    IOC = 1,   // 市价单，立即成交，剩余作废不挂簿
+    FOK = 2,   // 必须全部成交，否则整个作废（不挂簿）
 };
 
 // ── Binary response: 48 bytes, fixed size ──
@@ -71,15 +81,18 @@ struct BinaryResponse
 
     union
     {
-        // type == RSP_TRADE
+        // type == RSP_TRADE（成交回报，供回测/策略统计盈亏）
+        // 对齐交易协议语义（参考 Trader oms/order_protocol.h 的 'F'）：
+        //   策略只需知道 哪笔单(order_ref) / 方向(side) / 成交价(price) / 量(quantity)
         struct
         {
-            uint32_t price;
-            uint32_t quantity;
-            uint64_t buyer_id;
-            uint64_t seller_id;
-            uint64_t buy_order_id;
-            uint64_t sell_order_id;
+            uint64_t locate;      // 股票 locate
+            uint64_t order_ref;   // 被成交的挂单引用
+            uint8_t  side;        // SIDE_BUY / SIDE_SELL（统计盈亏需要）
+            uint8_t  _pad[3];
+            uint32_t price;       // 成交价（分）
+            uint32_t quantity;    // 成交量
+            uint8_t  _pad2[12];   // 保持 union 最大成员 40B → BinaryResponse 48B 不变
         } trade;
 
         // type == RSP_OK / RSP_FILLED / RSP_CANCELLED
@@ -106,6 +119,7 @@ struct BinaryResponse
         // type == RSP_BOOK
         struct
         {
+            uint64_t locate;       // 该盘口所属股票
             uint32_t bid_price;
             uint32_t bid_volume;
             uint32_t ask_price;

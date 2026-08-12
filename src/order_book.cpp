@@ -33,7 +33,7 @@ bool OrderBook::addOrder(const Order& order)
     level.count++;
     level.total_qty += order.remaining_qty;
 
-    order_index_.insert(order.order_id, new_order);
+    index_->insert(order.order_id, new_order);
     return true;
 }
 
@@ -79,13 +79,13 @@ void OrderBook::removeOrder(Order* order)
             asks_.erase(order->price);
     }
 
-    order_index_.erase(order->order_id);
+    index_->erase(order->order_id);
     pool_->deallocate(idx);
 }
 
 bool OrderBook::removeOrder(uint64_t order_id, uint64_t user_id)
 {
-    Order* order = order_index_.find(order_id);
+    Order* order = index_->find(order_id);
     if (!order) return false;
     if (order->user_id != user_id) return false;
 
@@ -133,6 +133,33 @@ Order* OrderBook::getBestAsk(uint64_t exclude_user_id)
     return nullptr;
 }
 
+uint32_t OrderBook::availableQty(Side side, uint32_t price) const
+{
+    uint32_t total = 0;
+    if (side == Side::BUY) {
+        // 买单吃卖盘：asks_ 升序，价格 ≤ 我方买价才可吃
+        for (auto& [p, level] : asks_) {
+            if (p > price) break;
+            uint32_t idx = level.head_idx;
+            while (idx != UINT32_MAX) {
+                total += pool_->at(idx)->remaining_qty;
+                idx = pool_->at(idx)->next_idx;
+            }
+        }
+    } else {
+        // 卖单吃买盘：bids_ 降序，价格 ≥ 我方卖价才可吃
+        for (auto& [p, level] : bids_) {
+            if (p < price) break;
+            uint32_t idx = level.head_idx;
+            while (idx != UINT32_MAX) {
+                total += pool_->at(idx)->remaining_qty;
+                idx = pool_->at(idx)->next_idx;
+            }
+        }
+    }
+    return total;
+}
+
 TopOfBook OrderBook::getTopOfBook() const
 {
     TopOfBook tob;
@@ -154,7 +181,7 @@ TopOfBook OrderBook::getTopOfBook() const
 
 Order* OrderBook::findOrder(uint64_t order_id)
 {
-    return order_index_.find(order_id);
+    return index_->find(order_id);
 }
 
 void OrderBook::printBook(int levels) const

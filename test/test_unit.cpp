@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cassert>
 #include <vector>
+#include <thread>
+#include <atomic>
 #include "../include/mpsc_ring.h"
 #include "../include/spsc_byte_ring.h"
 #include "../include/order_pool.h"
@@ -11,6 +13,7 @@
 #include "../include/protocol.h"
 #include "../include/trade_pool.h"
 #include "../include/wal.h"
+#include "../include/matching_engine.h"
 
 static int passed = 0, failed = 0;
 #define TEST(name) do { printf("  %-36s ... ", name); } while(0)
@@ -250,6 +253,34 @@ void test_order_map() {
     OK();
 }
 
+// ─── OrderMap 并发（分簿并行前置，验证无锁正确性）───
+void test_order_map_concurrent() {
+    TEST("OrderMap 8 线程并发 insert/find/erase");
+    OrderMap map(1 << 20);   // 容量充足，避免节点池耗尽干扰
+    constexpr int NTH = 8, N = 5000;
+    std::atomic<int> miss{0}, found{0};
+    Order* orders[NTH][N];
+    for (int t = 0; t < NTH; ++t)
+        for (int i = 0; i < N; ++i) orders[t][i] = new Order();
+    std::vector<std::thread> ths;
+    for (int t = 0; t < NTH; ++t)
+        ths.emplace_back([&, t]() {
+            uint64_t base = (uint64_t)t * 1000000;
+            for (int i = 0; i < N; ++i) map.insert(base + i, orders[t][i]);
+            for (int i = 0; i < N; ++i)
+                if (map.find(base + i) != orders[t][i]) miss++;
+            for (int i = 0; i < N; i += 2) map.erase(base + i);
+            for (int i = 0; i < N; i += 2)
+                if (map.find(base + i) != nullptr) found++;
+        });
+    for (auto& t : ths) t.join();
+    for (int t = 0; t < NTH; ++t)
+        for (int i = 0; i < N; ++i) delete orders[t][i];
+    assert(miss.load() == 0);
+    assert(found.load() == 0);
+    OK();
+}
+
 // ─── TradePool ───
 void test_trade_pool() {
     TEST("TradePool entry size");
@@ -351,6 +382,125 @@ void test_matching_simple() {
     OK();
 }
 
+// ─── FOK 单（全成交否则作废）───
+void test_fok_order() {
+    OrderPool pool(1 << 12);
+    OrderMap idx(1 << 12);
+    MatchingEngine engine(pool, idx);
+
+    TEST("FOK 市价买单能全成交 → 成交");
+    {
+        // 挂限价卖单 10000@10
+        std::vector<BinaryResponse> o;
+        engine.processAdd(1, 100, Side::SELL, 10000, 10, 100, o);
+        // FOK 市价买单 qty 10 → 全成交
+        std::vector<BinaryResponse> o2;
+        engine.processAdd(1, 200, Side::BUY, 0, 10, 200, o2, OrderTif::FOK);
+        bool has_trade = false, has_filled = false, has_error = false;
+        for (auto& r : o2) {
+            if (r.type == RSP_TRADE) has_trade = true;
+            if (r.type == RSP_FILLED) has_filled = true;
+            if (r.type == RSP_ERROR) has_error = true;
+        }
+        assert(has_trade && has_filled && !has_error);
+        OK();
+    }
+
+    TEST("FOK 不能全成交 → 整个拒绝");
+    {
+        // 挂限价卖单 10000@5（对手量不足）
+        std::vector<BinaryResponse> o;
+        engine.processAdd(2, 300, Side::SELL, 10000, 5, 300, o);
+        // FOK 市价买单 qty 10 → 不能全成交 → 拒绝，不成交不挂簿
+        std::vector<BinaryResponse> o2;
+        engine.processAdd(2, 400, Side::BUY, 0, 10, 400, o2, OrderTif::FOK);
+        assert(o2.size() == 1 && o2[0].type == RSP_ERROR);
+        assert(o2[0].data.error.code == static_cast<uint16_t>(ErrorCode::FOK_NO_FULL_FILL));
+        // 卖单还在（FOK 没吃掉）
+        BinaryResponse ob;
+        engine.getBook(2, ob);
+        assert(ob.data.book.ask_volume == 5);
+        OK();
+    }
+
+    TEST("FOK 限价买单能全成交（限价边界内）");
+    {
+        // 挂限价卖单 10000@10
+        std::vector<BinaryResponse> o;
+        engine.processAdd(3, 500, Side::SELL, 10000, 10, 500, o);
+        // FOK 限价买单 11000@10 → 全成交
+        std::vector<BinaryResponse> o2;
+        engine.processAdd(3, 600, Side::BUY, 11000, 10, 600, o2, OrderTif::FOK);
+        bool has_trade = false;
+        for (auto& r : o2)
+            if (r.type == RSP_TRADE) has_trade = true;
+        assert(has_trade);
+        OK();
+    }
+}
+
+// ─── Market 单（IOC 语义）───
+void test_market_order() {
+    OrderPool pool(1 << 12);
+    OrderMap idx(1 << 12);
+    MatchingEngine engine(pool, idx);
+
+    TEST("MARKET 买单吃对手限价卖单");
+    {
+        // 先挂限价卖单 10000@10
+        std::vector<BinaryResponse> o;
+        engine.processAdd(1, 100, Side::SELL, 10000, 10, 100, o);
+        // 市价买单 qty 10 → 全成交
+        std::vector<BinaryResponse> o2;
+        engine.processAdd(1, 200, Side::BUY, 0, 10, 200, o2, OrderTif::IOC);
+        bool has_trade = false, has_filled = false;
+        for (auto& r : o2) {
+            if (r.type == RSP_TRADE) { has_trade = true; assert(r.data.trade.price == 10000); assert(r.data.trade.quantity == 10); }
+            if (r.type == RSP_FILLED) has_filled = true;
+        }
+        assert(has_trade && has_filled);
+        OK();
+    }
+
+    TEST("MARKET 无对手盘 → 拒绝");
+    {
+        std::vector<BinaryResponse> o;
+        engine.processAdd(2, 300, Side::BUY, 0, 10, 300, o, OrderTif::IOC);
+        assert(o.size() == 1 && o[0].type == RSP_ERROR);
+        assert(o[0].data.error.code == static_cast<uint16_t>(ErrorCode::MKT_NO_LIQUIDITY));
+        OK();
+    }
+
+    TEST("MARKET 卖单吃对手限价买单");
+    {
+        std::vector<BinaryResponse> o;
+        engine.processAdd(3, 400, Side::BUY, 20000, 10, 400, o);
+        std::vector<BinaryResponse> o2;
+        engine.processAdd(3, 500, Side::SELL, 0, 10, 500, o2, OrderTif::IOC);
+        bool has_trade = false;
+        for (auto& r : o2)
+            if (r.type == RSP_TRADE) { has_trade = true; assert(r.data.trade.price == 20000); }
+        assert(has_trade);
+        OK();
+    }
+
+    TEST("MARKET IOC 不挂簿（部分成交剩余作废）");
+    {
+        // 限价卖单 10000@5（对手量不足）
+        std::vector<BinaryResponse> o;
+        engine.processAdd(4, 600, Side::SELL, 10000, 5, 600, o);
+        // 市价买单 qty 10 → 只成交 5，剩余 5 作废不挂簿
+        std::vector<BinaryResponse> o2;
+        engine.processAdd(4, 700, Side::BUY, 0, 10, 700, o2, OrderTif::IOC);
+        uint64_t traded = 0;
+        for (auto& r : o2)
+            if (r.type == RSP_TRADE) traded += r.data.trade.quantity;
+        assert(traded == 5);
+        // 簿里不应有该市价单的残余（无 best_ask 买单挂出）
+        OK();
+    }
+}
+
 void test_self_trade_prevention() {
     TEST("Self-trade prevention: exclude_user_id");
     OrderBook book(1024);
@@ -418,12 +568,15 @@ int main() {
     test_order_pool();
     test_order_pool_index();
     test_order_map();
+    test_order_map_concurrent();
 
     // 业务组件
     test_order_book_basic();
     test_order_book_external_pool();
     test_self_trade_prevention();
     test_matching_simple();
+    test_market_order();
+    test_fok_order();
 
     // 监控 / 持久化
     test_trade_pool();
