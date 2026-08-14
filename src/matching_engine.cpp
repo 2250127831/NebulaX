@@ -276,9 +276,8 @@ void MatchingEngine::processCancelShares(
         rsp.type = RSP_CANCELLED;
         rsp.data.ack.order_id = order_ref;
     } else {
-        // 部分撤：减少剩余量 + 档量
-        o->remaining_qty -= shares;
-        book->reduceOrderQty(o, shares);
+        // 部分撤：只减剩余量 + 档量（撤单不是成交，不加 filled_qty）
+        book->reduceQtyCancel(o, shares);
         auto& rsp = out.emplace_back();
         rsp.type = RSP_OK;
         rsp.data.ack.order_id = order_ref;
@@ -435,7 +434,7 @@ void MatchingEngine::recoverFromWal(const char* wal_path)
             Order* o = book->findOrder(entry->order_id);
             if (o && entry->quantity > 0) {
                 if (entry->quantity >= o->remaining_qty) book->removeOrder(o);
-                else { o->remaining_qty -= entry->quantity; book->reduceOrderQty(o, entry->quantity); }
+                else book->reduceQtyCancel(o, entry->quantity);
             }
         } else if (entry->type == 0x04) {  // 改单
             Order* o = book->findOrder(entry->order_id);

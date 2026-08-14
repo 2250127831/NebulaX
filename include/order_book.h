@@ -57,6 +57,8 @@ public:
     Order* getBestBid(uint64_t exclude_user_id = 0);
     Order* getBestAsk(uint64_t exclude_user_id = 0);
     void reduceOrderQty(Order* order, uint32_t amount);
+    // 部分撤单：只减剩余量 + 档量，不增加已成交量（撤单不是成交）。
+    void reduceQtyCancel(Order* order, uint32_t amount);
     TopOfBook getTopOfBook() const;
 
     // 对手盘可吃总量（FOK 预检查用）：按价格-时间优先累计可成交量。

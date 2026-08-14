@@ -439,6 +439,62 @@ void test_fok_order() {
     }
 }
 
+// ─── 部分撤单（X）───
+void test_partial_cancel() {
+    OrderPool pool(1 << 12);
+    OrderMap idx(1 << 12);
+    MatchingEngine engine(pool, idx);
+
+    TEST("部分撤单只减一次 remaining，不算成交");
+    {
+        // 挂限价买单 40 @ 10000
+        std::vector<BinaryResponse> o;
+        engine.processAdd(1, 100, Side::BUY, 10000, 40, 100, o);
+
+        // X 部分撤 15 → 剩余应 25（修复前双扣成 10）
+        std::vector<BinaryResponse> c;
+        engine.processCancelShares(1, 100, 15, 100, c);
+        assert(c.size() == 1 && c[0].type == RSP_OK);
+
+        OrderBook* book = engine.book_for(1);
+        Order* bid = book->findOrder(100);
+        assert(bid && bid->remaining_qty == 25);   // 只减一次
+        assert(bid->filled_qty == 0);              // 撤单不算成交
+
+        // 档量同步减 15（40-15=25）
+        BinaryResponse ob;
+        engine.getBook(1, ob);
+        assert(ob.data.book.bid_volume == 25);
+        OK();
+    }
+
+    TEST("部分撤后成交 + 整笔删都能正常找到订单");
+    {
+        // 继续：卖 10 @ 10000 吃 10 → 剩余应 15
+        std::vector<BinaryResponse> t;
+        engine.processAdd(1, 200, Side::SELL, 10000, 10, 200, t);
+        bool has_trade = false;
+        for (auto& r : t)
+            if (r.type == RSP_TRADE) has_trade = true;
+        assert(has_trade);
+
+        OrderBook* book = engine.book_for(1);
+        Order* bid = book->findOrder(100);
+        assert(bid && bid->remaining_qty == 15);   // 25-10，无双扣残留
+        assert(bid->filled_qty == 10);             // 只有成交计入
+
+        BinaryResponse ob;
+        engine.getBook(1, ob);
+        assert(ob.data.book.bid_volume == 15);
+
+        // D 整笔撤 → 应成功（修复前：剩余被双扣成 0，这里报 ORDER_NOT_FOUND）
+        std::vector<BinaryResponse> d;
+        engine.processCancel(1, 100, 100, d);
+        assert(d.size() == 1 && d[0].type == RSP_CANCELLED);
+        OK();
+    }
+}
+
 // ─── Market 单（IOC 语义）───
 void test_market_order() {
     OrderPool pool(1 << 12);
@@ -577,6 +633,7 @@ int main() {
     test_matching_simple();
     test_market_order();
     test_fok_order();
+    test_partial_cancel();
 
     // 监控 / 持久化
     test_trade_pool();

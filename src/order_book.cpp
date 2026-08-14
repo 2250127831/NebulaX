@@ -47,6 +47,15 @@ void OrderBook::reduceOrderQty(Order* order, uint32_t amount)
     level.total_qty -= amount;
 }
 
+void OrderBook::reduceQtyCancel(Order* order, uint32_t amount)
+{
+    order->remaining_qty -= amount;   // 只减剩余，不加 filled_qty
+
+    PriceLevel& level = (order->side == Side::BUY)
+        ? bids_[order->price] : asks_[order->price];
+    level.total_qty -= amount;
+}
+
 void OrderBook::removeOrder(Order* order)
 {
     uint32_t idx = pool_->indexOf(order);
